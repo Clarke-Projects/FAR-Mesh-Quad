@@ -1,0 +1,184 @@
+pkgname=far-mesh-quad-native
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="FAR MESH Quad native no-venv package"
+arch=("x86_64")
+url="https://local.far-mesh"
+license=("MIT" "BSD-2-Clause" "BSD-3-Clause" "GPL-3.0-only")
+
+depends=(
+  "bash"
+  "python"
+  "pyside6"
+  "shiboken6"
+  "python-numpy"
+  "python-scipy"
+  "python-scikit-learn"
+  "python-narwhals"
+  "python-pillow"
+  "python-yaml"
+  "python-psutil"
+  "python-requests"
+  "python-pandas"
+  "python-matplotlib"
+  "vtk"
+  "ospray"
+  "openvr"
+  "anari-sdk"
+  "netcdf"
+  "pdal"
+  "liblas"
+  "adios2"
+  "paraview-catalyst"
+  "cgns"
+  "gl2ps"
+  "onnxruntime-cpu"
+  "viskores"
+  "python-trimesh"
+  "python-pyvista"
+  "python-pyvistaqt"
+  "python-open3d"
+  "python-rendercanvas"
+  "python-wgpu"
+  "python-pylinalg"
+  "python-pygfx"
+  "python-cffi"
+  "python-pycparser"
+  "python-jinja"
+  "python-markupsafe"
+  "python-freetype-py"
+  "python-hsluv"
+  "python-uharfbuzz"
+  "glibc"
+  "gcc-libs"
+  "blas"
+  "lapack"
+  "suitesparse"
+  "libx11"
+  "libxext"
+  "libxrandr"
+  "libxinerama"
+  "libxcursor"
+  "libxrender"
+  "libxfixes"
+  "libxxf86vm"
+  "libxcb"
+  "libxau"
+  "libxdmcp"
+  "libglvnd"
+  "mesa"
+  "vulkan-icd-loader"
+  "qt6-base"
+  "qt6-wayland"
+  "xcb-util-cursor"
+  "libxkbcommon"
+)
+
+makedepends=("tar" "zstd" "gcc" "python")
+
+source=(
+  "far-mesh-quad-native-${pkgver}.tar.zst"
+  "far-mesh-quad-native-wrapper.c"
+  "far-mesh-quad-native.desktop"
+  "far-mesh-quad-native.png"
+  "LICENSE_FAR_Mesh_Quad.txt"
+  "LICENSE_cgg-bern_quadwild-bimdf.txt"
+  "LICENSE_instant-meshes.txt"
+  "LICENSE_NumPy.txt"
+  "LICENSE_Open3D.txt"
+  "LICENSE_pygfx.txt"
+  "LICENSE_pygfx_wgpu-py.txt"
+  "LICENSE_pyside.txt"
+  "LICENSE_pyvista.txt"
+  "LICENSE_scikit-learn.txt"
+  "LICENSE_SciPy.txt"
+  "LICENSE_trimesh.txt"
+  "LICENSE_VTK.txt"
+)
+
+sha256sums=(
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+  "SKIP"
+)
+
+build() {
+    cc -O2 -Wall -Wextra \
+      -I/usr/include/python3.14 \
+      -o "$srcdir/far-mesh-quad-native" \
+      "$srcdir/far-mesh-quad-native-wrapper.c" \
+      -L/usr/lib \
+      -lpython3.14 \
+      -ldl \
+      -lm
+}
+
+package() {
+    install -dm755 "$pkgdir/opt/far-mesh-quad-native"
+    cp -a "$srcdir/far-mesh-quad-native-${pkgver}/." "$pkgdir/opt/far-mesh-quad-native/"
+
+    install -Dm755 "$srcdir/far-mesh-quad-native" \
+      "$pkgdir/usr/bin/far-mesh-quad-native"
+
+    install -Dm644 "$srcdir/far-mesh-quad-native.desktop" \
+      "$pkgdir/usr/share/applications/far-mesh-quad-native.desktop"
+
+    install -Dm644 "$srcdir/far-mesh-quad-native.png" \
+      "$pkgdir/usr/share/icons/hicolor/256x256/apps/far-mesh-quad-native.png"
+
+    # FAR MESH Quad and bundled third-party license files.
+    # Runtime/source-traceability copy inside app root.
+    install -dm755 "$pkgdir/opt/far-mesh-quad-native/bin/License"
+
+    install -m644 "$srcdir/LICENSE_FAR_Mesh_Quad.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_cgg-bern_quadwild-bimdf.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_instant-meshes.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_NumPy.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_Open3D.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_pygfx.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_pygfx_wgpu-py.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_pyside.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_pyvista.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_scikit-learn.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_SciPy.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_trimesh.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+    install -m644 "$srcdir/LICENSE_VTK.txt" \
+      "$pkgdir/opt/far-mesh-quad-native/bin/License/"
+
+    # Standard Arch/CachyOS package-license location.
+    install -dm755 "$pkgdir/usr/share/licenses/$pkgname"
+
+    cp -a "$pkgdir/opt/far-mesh-quad-native/bin/License/." \
+      "$pkgdir/usr/share/licenses/$pkgname/"
+
+    find "$pkgdir/opt/far-mesh-quad-native/bin/License" -type d -exec chmod 755 {} +
+    find "$pkgdir/opt/far-mesh-quad-native/bin/License" -type f -exec chmod 644 {} +
+    find "$pkgdir/usr/share/licenses/$pkgname" -type d -exec chmod 755 {} +
+    find "$pkgdir/usr/share/licenses/$pkgname" -type f -exec chmod 644 {} +
+}

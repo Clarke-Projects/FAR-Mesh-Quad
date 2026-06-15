@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+venv_sysqt/
+venv_sysqt314/
+_env_backups/
+
+# FAR MESH runtime/generated data
+exports/
+external_runs/
+snapshots/
+temp/
+trace_logs/
+.viewer_cache/
+recovery_backup/
+
+# Package build staging
+packaging/**/pkg/
+packaging/**/src/
+packaging/**/_staging/
+
+# Large package artifacts - upload through GitHub Releases instead
+*.pkg.tar.zst
+*.tar.zst
+*.tar.gz
+*.zip
+*.7z
+
+# Local/archival docs and cleanup material not for first public source push
+docs/archive_import_tree_materials_A8_20260507/
+docs/test-suite/archived_sources/
+docs/test-suite/cleanup-history/
+scripts/test_cleanup_archive/
+scripts/*.before_*
+far_mesh/*.before_*
+*.before_*
+README_preview.html
+
+# Built native wrapper binary inside packaging workdir
+packaging/native/far-mesh-quad-native/far-mesh-quad-native
+
+# Local package probe reports
+packaging/native/*probe*.txt
+packaging/native/*candidates*.txt
+packaging/native/*search*.txt
+packaging/native/*missing*.txt
+packaging/native/reports/
+
+# Large/vendor package stores; keep for local packaging, not normal Git
+packaging/native/prebuilt/
+packaging/native/wgpu-stack/
+packaging/arch/
+
+
+
+# Local previews
+README_preview.html
+
+# Editor/system
+.DS_Store
+Thumbs.db
+*.swp
+*~

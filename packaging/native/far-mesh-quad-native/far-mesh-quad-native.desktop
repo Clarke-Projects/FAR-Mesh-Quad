@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FAR MESH Quad Native
+Comment=FAR MESH Quad native system-Python package
+Exec=/usr/bin/far-mesh-quad-native
+Icon=far-mesh-quad-native
+Terminal=false
+Categories=Graphics;Engineering;Science;
+StartupNotify=true
+StartupWMClass=far-mesh-quad-native
