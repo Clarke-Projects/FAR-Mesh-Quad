@@ -35,7 +35,7 @@ packaging/**/pkg/
 packaging/**/src/
 packaging/**/_staging/
 
-# Large package artifacts - upload through GitHub Releases instead
+# Large package artifacts - upload final app packages through GitHub Releases instead
 
 *.pkg.tar.zst
 *.tar.zst
@@ -43,11 +43,37 @@ packaging/**/_staging/
 *.zip
 *.7z
 
-# Large/vendor package stores; keep for local packaging, not normal Git
+# Vendored packaging dependencies intentionally kept in Git.
+# Keep only package artifacts, not extracted pkg/src build trees.
+!packaging/native/prebuilt/
+!packaging/native/prebuilt/*.pkg.tar.zst
 
-packaging/native/prebuilt/
-packaging/native/wgpu-stack/
+!packaging/native/wgpu-stack/
+!packaging/native/wgpu-stack/packages/
+!packaging/native/wgpu-stack/packages/*.pkg.tar.zst
+!packaging/native/wgpu-stack/python-pygfx/
+!packaging/native/wgpu-stack/python-pygfx/*.pkg.tar.zst
+!packaging/native/wgpu-stack/python-pylinalg/
+!packaging/native/wgpu-stack/python-pylinalg/*.pkg.tar.zst
+!packaging/native/wgpu-stack/python-rendercanvas/
+!packaging/native/wgpu-stack/python-rendercanvas/*.pkg.tar.zst
+!packaging/native/wgpu-stack/python-wgpu/
+!packaging/native/wgpu-stack/python-wgpu/*.pkg.tar.zst
+
+# Never commit extracted package build/install trees.
+packaging/native/wgpu-stack/**/pkg/
+packaging/native/wgpu-stack/**/src/
+packaging/native/wgpu-stack/**/__pycache__/
+packaging/native/wgpu-stack/**/*.pyc
+packaging/native/wgpu-stack/**/*.whl
+
+# Final built FAR MESH packages still stay out of normal Git
+
 packaging/arch/
+packaging/native/far-mesh-quad-native/*.pkg.tar.zst
+packaging/native/far-mesh-quad-native/pkg/
+packaging/native/far-mesh-quad-native/src/
+packaging/native/far-mesh-quad-native/_staging/
 
 # Built native wrapper binary inside packaging workdir
 
@@ -65,10 +91,6 @@ packaging/native/reports/
 
 /PACKAGING_ARTIFACTS_SHA256.txt
 /packaging/PACKAGING_ARTIFACTS_SHA256.txt
-
-# FAR MESH local-only external binaries and runtime/vendor payloads
-
-
 
 # Local/archival docs and cleanup material not for first public source push
 
