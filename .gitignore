@@ -68,10 +68,7 @@ packaging/native/reports/
 
 # FAR MESH local-only external binaries and runtime/vendor payloads
 
-bin/Instant Meshes
-bin/config/
-bin/quadwild
-quadwild-bimdf/
+
 
 # Local/archival docs and cleanup material not for first public source push
 
