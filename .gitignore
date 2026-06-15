@@ -1,11 +1,13 @@
 # Python
-__pycache__/
+
+**pycache**/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
 # Virtual environments
+
 venv/
 .venv/
 venv_sysqt/
@@ -13,6 +15,7 @@ venv_sysqt314/
 _env_backups/
 
 # FAR MESH runtime/generated data
+
 exports/
 external_runs/
 snapshots/
@@ -21,49 +24,72 @@ trace_logs/
 .viewer_cache/
 recovery_backup/
 
+# Local previews
+
+README_preview.html
+
 # Package build staging
+
 packaging/**/pkg/
 packaging/**/src/
 packaging/**/_staging/
 
 # Large package artifacts - upload through GitHub Releases instead
+
 *.pkg.tar.zst
 *.tar.zst
 *.tar.gz
 *.zip
 *.7z
 
-# Local/archival docs and cleanup material not for first public source push
-docs/archive_import_tree_materials_A8_20260507/
-docs/test-suite/archived_sources/
-docs/test-suite/cleanup-history/
-scripts/test_cleanup_archive/
-scripts/*.before_*
-far_mesh/*.before_*
-*.before_*
-README_preview.html
+# Large/vendor package stores; keep for local packaging, not normal Git
+
+packaging/native/prebuilt/
+packaging/native/wgpu-stack/
+packaging/arch/
 
 # Built native wrapper binary inside packaging workdir
+
 packaging/native/far-mesh-quad-native/far-mesh-quad-native
 
 # Local package probe reports
+
 packaging/native/*probe*.txt
 packaging/native/*candidates*.txt
 packaging/native/*search*.txt
 packaging/native/*missing*.txt
 packaging/native/reports/
 
-# Large/vendor package stores; keep for local packaging, not normal Git
-packaging/native/prebuilt/
-packaging/native/wgpu-stack/
-packaging/arch/
+# FAR MESH local-only external binaries and runtime/vendor payloads
 
+bin/Instant Meshes
+bin/config/
+bin/quadwild
+quadwild-bimdf/
 
+# Local/archival docs and cleanup material not for first public source push
 
-# Local previews
-README_preview.html
+_archive/
+dokuv8/
+docs/archive_import_tree_materials_A8_20260507/
+docs/test-suite/
+scripts/test_cleanup_archive/
+
+# Local handover/start notes
+
+scripts/FAR_MESH_BoreTool_Handover_after_v22_failure.md
+scripts/FAR_MESH_BoreTool_NEXT_CHAT_START_HERE.md
+scripts/start code 2.txt
+scripts/startscript 3.txt
+
+# Backup/patch snapshot files
+
+scripts/*.before_*
+far_mesh/*.before_*
+*.before_*
 
 # Editor/system
+
 .DS_Store
 Thumbs.db
 *.swp
