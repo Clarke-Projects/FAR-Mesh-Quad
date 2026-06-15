@@ -1,0 +1,31 @@
+# FAR MESH Quad local native package
+# Generated for Option B no-venv packaging validation.
+
+pkgname=python-pygfx
+_pyname=pygfx
+pkgver=0.16.0
+pkgrel=1
+pkgdesc="Powerful and versatile visualization for Python"
+arch=("any")
+url="https://pypi.org/project/pygfx/"
+license=("custom")
+depends=("python" "python-freetype-py" "python-hsluv" "python-jinja" "python-numpy" "python-pylinalg" "python-rendercanvas" "python-uharfbuzz" "python-wgpu")
+makedepends=("python-pip" "python-installer")
+source=()
+sha256sums=()
+
+build() {
+    cd "$srcdir"
+    python -m pip download --no-deps --only-binary=:all: --dest "$srcdir" "${_pyname}==${pkgver}"
+}
+
+package() {
+    cd "$srcdir"
+    local wheel
+    wheel="$(find "$srcdir" -maxdepth 1 -type f -name "${_pyname}-${pkgver}-*.whl" | head -n 1)"
+    if [[ -z "$wheel" ]]; then
+        echo "Wheel not found for ${_pyname} ${pkgver}" >&2
+        exit 1
+    fi
+    python -m installer --destdir="$pkgdir" "$wheel"
+}
