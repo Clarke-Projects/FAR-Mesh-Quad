@@ -31,6 +31,17 @@ Current validated checkpoint:
 
 The native package has been validated with project restore, WGPU startup, dependency imports, Bore candidate analysis, Bore rebuild, undo, redo, and license payload installation.
 
+The public GitHub repository has also been validated from a clean clone. The clean clone can build, install, and launch the native Option B package with bundled Instant Meshes, QuadWild-BiMDF, vendored Open3D, vendored WGPU stack packages, and the full license bundle.
+
+---
+
+## Quick links
+
+* [Clean clone package build procedure](HOWTO_BUILD.md)
+* [Root license](LICENSE)
+* [FAR MESH Quad license scope notice](bin/License/LICENSE_FAR_Mesh_Quad.txt)
+* [Bundled license files](bin/License)
+
 ---
 
 ## Screenshots
@@ -115,12 +126,50 @@ The BoreTool architecture keeps responsibilities separated:
 
 ## Installation
 
+### Clean clone package build
+
+The validated way to build FAR MESH Quad from the public repository is the native no-venv Option B package flow.
+
+See:
+
+```text
+HOWTO_BUILD.md
+```
+
+for the complete clean-clone package build procedure.
+
+Validated clean-clone result:
+
+```text
+Repository clone: PASS
+Required runtime payload present: PASS
+Vendored dependency packages present: PASS
+Native package build: PASS
+Package install: PASS
+Application launch: PASS
+WGPU startup: PASS
+```
+
+Validated package output:
+
+```text
+packaging/native/far-mesh-quad-native/far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+Validated repository:
+
+```text
+https://github.com/Clarke-Projects/FAR-Mesh-Quad
+```
+
 ### Option B: native CachyOS / Arch package
 
 The preferred package is the native no-venv package:
 
 ```bash
-sudo pacman -U packaging/native/far-mesh-quad-native/far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+cd packaging/native/far-mesh-quad-native
+bash build-local-package.sh
+sudo pacman -U far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 Run:
@@ -164,10 +213,12 @@ The Vulkan extension warning is currently non-blocking on the validated developm
 
 Option A is the larger conservative package that carries a private Python environment under `/opt/far-mesh-quad`.
 
-It remains useful as a fallback while development is active.
+It remains useful as a fallback while development is active, but the clean-clone validation currently targets Option B.
+
+If an Option A package is provided as a release asset or produced locally, install it with:
 
 ```bash
-sudo pacman -U packaging/arch/far-mesh-quad-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U far-mesh-quad-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 Run:
@@ -178,9 +229,67 @@ far-mesh-quad
 
 ---
 
+## Clean clone validation
+
+A clean clone has been validated with the following procedure:
+
+```bash
+cd ~/Schreibtisch
+
+git clone https://github.com/Clarke-Projects/FAR-Mesh-Quad.git FAR_Mesh_Quad_clone_test
+
+cd FAR_Mesh_Quad_clone_test
+```
+
+Required payload check:
+
+```bash
+test -f 'bin/Instant Meshes' && echo "OK Instant Meshes"
+test -f bin/quadwild && echo "OK quadwild"
+test -d bin/config && echo "OK bin/config"
+test -d quadwild-bimdf && echo "OK quadwild-bimdf"
+test -f 'packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst' && echo "OK Open3D prebuilt"
+test -d packaging/native/wgpu-stack/packages && echo "OK WGPU package folder"
+test -f packaging/native/far-mesh-quad-native/PKGBUILD && echo "OK PKGBUILD"
+test -f packaging/native/far-mesh-quad-native/build-local-package.sh && echo "OK build script"
+```
+
+Vendored native dependencies:
+
+```bash
+sudo pacman -U --needed \
+  'packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst' \
+  packaging/native/wgpu-stack/packages/*.pkg.tar.zst
+```
+
+Native package build:
+
+```bash
+cd packaging/native/far-mesh-quad-native
+bash build-local-package.sh
+```
+
+Install and launch:
+
+```bash
+sudo pacman -U far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+far-mesh-quad-native
+```
+
+Validated clean-clone package result:
+
+```text
+Package: far-mesh-quad-native
+Version: 0.1.0-1
+Installed size: approximately 34 MiB
+Package file: far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+---
+
 ## Development launch
 
-From the project root:
+From the project root of the local development tree:
 
 ```bash
 cd ~/Schreibtisch/FAR_MESH_quad_3
@@ -201,6 +310,8 @@ env FAR_MESH_VIEWPORT_BACKEND=wgpu QT_QPA_PLATFORM=xcb venv_sysqt314/bin/python 
 ```
 
 Do not use the old deleted `venv` path.
+
+Note: the clean public repository is validated for native package build and install. The local development launcher expects the maintainer development environment to already exist.
 
 ---
 
@@ -275,14 +386,16 @@ quadwild-bimdf/
   build/Build/lib/
 
 packaging/
-  arch/
   native/
+    far-mesh-quad-native/
+    prebuilt/
+    wgpu-stack/
 
 scripts/
 docs/
 ```
 
-Important rule: a valid working copy or package must preserve the Python source, runtime launch scripts, external remesher executables, QuadWild-BiMDF configuration trees, and required bundled libraries.
+Important rule: a valid working copy or package must preserve the Python source, runtime launch scripts, external remesher executables, QuadWild-BiMDF configuration trees, required bundled libraries, vendored Open3D package, and vendored WGPU stack packages.
 
 ---
 
@@ -355,9 +468,46 @@ Current package license payload:
 LICENSE_FAR_Mesh_Quad.txt
 LICENSE_cgg-bern_quadwild-bimdf.txt
 LICENSE_instant-meshes.txt
+LICENSE_NumPy.txt
+LICENSE_Open3D.txt
+LICENSE_pygfx.txt
+LICENSE_pygfx_wgpu-py.txt
+LICENSE_pyside.txt
+LICENSE_pyvista.txt
+LICENSE_scikit-learn.txt
+LICENSE_SciPy.txt
+LICENSE_trimesh.txt
+LICENSE_VTK.txt
 ```
 
-The packaging tree intentionally preserves local/prepacked dependency packages for reproducibility, including the CPython 3.14 Open3D package and local WGPU/PyGFX stack packages.
+The packaging tree intentionally preserves local/prepacked dependency packages for reproducibility, including:
+
+```text
+packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst
+packaging/native/wgpu-stack/packages/*.pkg.tar.zst
+```
+
+The WGPU stack packaging recipes and helper scripts are also preserved:
+
+```text
+packaging/native/wgpu-stack/build-all.sh
+packaging/native/wgpu-stack/install-all.sh
+packaging/native/wgpu-stack/test-system-wgpu.sh
+packaging/native/wgpu-stack/python-pygfx/PKGBUILD
+packaging/native/wgpu-stack/python-pylinalg/PKGBUILD
+packaging/native/wgpu-stack/python-rendercanvas/PKGBUILD
+packaging/native/wgpu-stack/python-wgpu/PKGBUILD
+```
+
+Final built FAR MESH application packages should normally be published as GitHub Release assets rather than committed as ordinary source files.
+
+Generated build directories should not be committed:
+
+```text
+packaging/**/pkg/
+packaging/**/src/
+packaging/**/_staging/
+```
 
 ---
 
@@ -367,6 +517,9 @@ FAR MESH Quad uses and/or packages several external components:
 
 * Instant Meshes
 * QuadWild-BiMDF
+* NumPy
+* SciPy
+* scikit-learn
 * Open3D
 * Trimesh
 * PyVista
@@ -381,7 +534,13 @@ Each external component remains under its own license. See the license files in 
 
 ## License
 
-FAR MESH Quad license information is provided in:
+The clean root repository license is:
+
+```text
+LICENSE
+```
+
+FAR MESH Quad project-specific license and scope information is provided in:
 
 ```text
 bin/License/LICENSE_FAR_Mesh_Quad.txt
@@ -392,13 +551,26 @@ Bundled third-party license files are provided in:
 ```text
 bin/License/LICENSE_cgg-bern_quadwild-bimdf.txt
 bin/License/LICENSE_instant-meshes.txt
+bin/License/LICENSE_NumPy.txt
+bin/License/LICENSE_Open3D.txt
+bin/License/LICENSE_pygfx.txt
+bin/License/LICENSE_pygfx_wgpu-py.txt
+bin/License/LICENSE_pyside.txt
+bin/License/LICENSE_pyvista.txt
+bin/License/LICENSE_scikit-learn.txt
+bin/License/LICENSE_SciPy.txt
+bin/License/LICENSE_trimesh.txt
+bin/License/LICENSE_VTK.txt
 ```
 
-Installed native package license location:
+Installed native package license locations:
 
 ```text
+/opt/far-mesh-quad-native/bin/License/
 /usr/share/licenses/far-mesh-quad-native/
 ```
+
+The FAR MESH Quad root license does not relicense bundled third-party components. Third-party components remain governed by their own license files.
 
 ---
 
