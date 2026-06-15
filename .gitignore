@@ -1,6 +1,7 @@
 # Python
 
 **pycache**/
+**/**pycache**/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
@@ -59,6 +60,11 @@ packaging/native/*candidates*.txt
 packaging/native/*search*.txt
 packaging/native/*missing*.txt
 packaging/native/reports/
+
+# Local release checksum inventory; upload with GitHub Releases
+
+/PACKAGING_ARTIFACTS_SHA256.txt
+/packaging/PACKAGING_ARTIFACTS_SHA256.txt
 
 # FAR MESH local-only external binaries and runtime/vendor payloads
 
