@@ -66,6 +66,10 @@ The public GitHub repository has also been validated from a clean clone. The cle
 
 <img src="docs/images/Hole_Fill_2.png" alt="Hole fill committed result" width="900">
 
+### Remeshing workflow
+
+<img src="docs/images/Remeshing.png" alt="FAR MESH Quad remeshing workflow with remeshed output visible in the WGPU viewport" width="900">
+
 ---
 
 ## Features
