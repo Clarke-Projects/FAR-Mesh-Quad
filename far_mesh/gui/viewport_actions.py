@@ -256,8 +256,6 @@ class ViewportActionsMixin:
             self.viewer_boundary_check.setToolTip("Highlight open mesh boundaries in the current viewport.")
             self.viewer_focus_selection_btn.setToolTip("Focus the camera on the current face, point, or edge selection.")
             self.viewer_clear_selection_btn.setToolTip("Clear the current viewport selection.")
-            self.viewport_open_viewer_btn.setToolTip("Open the full viewer control page.")
-            self.viewport_open_brush_btn.setToolTip("Open the brush / tools page for face, point, and edge selection workflows.")
 
             selection_tip = [
                 "Selection tools available in this backend:",

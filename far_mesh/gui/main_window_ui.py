@@ -295,14 +295,8 @@ class MainWindowUI:
         self.viewport_reset_btn = QPushButton("Reset Camera")
         self.viewport_reset_btn.clicked.connect(self._reset_camera_from_quickbar)
 
-        self.viewport_open_viewer_btn = QPushButton("Viewer Tools")
-        self.viewport_open_viewer_btn.clicked.connect(lambda: self._show_page(self.PAGE_VIEWER))
 
-        self.viewport_open_brush_btn = QPushButton("Brush Tools")
-        self.viewport_open_brush_btn.clicked.connect(lambda: self._show_page(self.PAGE_BRUSH))
 
-        self.viewport_open_bore_btn = QPushButton("Bore Tools")
-        self.viewport_open_bore_btn.clicked.connect(lambda: self._show_page(self.PAGE_BORE))
 
         quick.addWidget(QLabel("Preset:"))
         quick.addWidget(self.viewport_quick_preset_combo)
@@ -314,9 +308,6 @@ class MainWindowUI:
         quick.addStretch(1)
         quick.addWidget(self.viewport_toggle_info_btn)
         quick.addWidget(self.viewport_reset_btn)
-        quick.addWidget(self.viewport_open_viewer_btn)
-        quick.addWidget(self.viewport_open_brush_btn)
-        quick.addWidget(self.viewport_open_bore_btn)
         layout.addLayout(quick)
 
         self.viewport = create_viewport(
