@@ -29,15 +29,16 @@ Current validated checkpoint:
 * Current development environment: `venv_sysqt314`
 * Current development launcher: `scripts/run.sh`
 
-The native package has been validated with project restore, WGPU startup, dependency imports, Bore candidate analysis, Bore rebuild, undo, redo, and license payload installation.
+The native source installer has been validated with system dependency binding, vendored Open3D/WGPU package installation, WGPU startup, dependency imports, native wrapper launch, project restore, Bore candidate analysis, Bore rebuild, undo, redo, desktop integration, and license payload installation.
 
-The public GitHub repository has also been validated from a clean clone. The clean clone can build, install, and launch the native Option B package with bundled Instant Meshes, QuadWild-BiMDF, vendored Open3D, vendored WGPU stack packages, and the full license bundle.
+The public GitHub repository is intended to install from a clean clone through the Option B native source-installer path with bundled Instant Meshes, QuadWild-BiMDF, vendored Open3D, vendored WGPU stack packages, and the full license bundle.
 
 ---
 
 ## Quick links
 
-* [Clean clone package build procedure](HOWTO_BUILD.md)
+* [Install from source on Arch / CachyOS](HOW_TO_INSTALL.md)
+* [Advanced manual native package build](HOWTO_BUILD.md)
 * [Root license](LICENSE)
 * [FAR MESH Quad license scope notice](bin/License/LICENSE_FAR_Mesh_Quad.txt)
 * [Bundled license files](bin/License)
@@ -53,6 +54,10 @@ The public GitHub repository has also been validated from a clean clone. The cle
 ### BoreTool recognition and rebuild workflow
 
 <img src="docs/images/Bore.png" alt="FAR MESH Quad BoreTool bore recognition and rebuild workflow" width="900">
+
+### Pocket recognition workflow
+
+<img src="docs/images/Pockets.png" alt="FAR MESH Quad pocket recognition workflow" width="900">
 
 ### Chamfer / transition feature view
 
@@ -130,53 +135,43 @@ The BoreTool architecture keeps responsibilities separated:
 
 ## Installation
 
-### Clean clone package build
+### Recommended public source install
 
-The validated way to build FAR MESH Quad from the public repository is the native no-venv Option B package flow.
+The recommended public install path for Arch / CachyOS is the native Option B source installer.
+It installs FAR MESH Quad as a native system application without an application virtual environment.
 
-See:
-
-```text
-HOWTO_BUILD.md
-```
-
-for the complete clean-clone package build procedure.
-
-Validated clean-clone result:
+See the full guide:
 
 ```text
-Repository clone: PASS
-Required runtime payload present: PASS
-Vendored dependency packages present: PASS
-Native package build: PASS
-Package install: PASS
-Application launch: PASS
-WGPU startup: PASS
+HOW_TO_INSTALL.md
 ```
 
-Validated package output:
-
-```text
-packaging/native/far-mesh-quad-native/far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
-```
-
-Validated repository:
-
-```text
-https://github.com/Clarke-Projects/FAR-Mesh-Quad
-```
-
-### Option B: native CachyOS / Arch package
-
-The preferred package is the native no-venv package:
+Fresh clone:
 
 ```bash
-cd packaging/native/far-mesh-quad-native
-bash build-local-package.sh
-sudo pacman -U far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+git clone https://github.com/Clarke-Projects/FAR-Mesh-Quad.git
+cd FAR-Mesh-Quad
 ```
 
-Run:
+Preview first:
+
+```bash
+bash packaging/install/install_far_mesh_quad.sh --target cachyos --dry-run
+```
+
+Install on an already-updated Arch / CachyOS system:
+
+```bash
+bash packaging/install/install_far_mesh_quad.sh --target cachyos --yes
+```
+
+Install on a fresh machine when you intentionally want a full system update first:
+
+```bash
+bash packaging/install/install_far_mesh_quad.sh --target cachyos --yes --system-update
+```
+
+Launch:
 
 ```bash
 far-mesh-quad-native
@@ -201,7 +196,7 @@ Installed layout:
 /usr/share/licenses/far-mesh-quad-native/
 ```
 
-The native package uses a compiled C wrapper as the launcher. The wrapper embeds CPython for the main GUI process and forces multiprocessing helpers back to `/usr/bin/python`, preventing recursive worker launches.
+The native launcher is a compiled C wrapper. It embeds system CPython for the main GUI process and forces multiprocessing helpers back to `/usr/bin/python`, preventing recursive worker launches.
 
 Expected startup messages may include:
 
@@ -213,80 +208,27 @@ Unable to find extension: VK_EXT_physical_device_drm
 
 The Vulkan extension warning is currently non-blocking on the validated development machine.
 
+### Advanced manual native package build
+
+`HOWTO_BUILD.md` is kept as the advanced/manual package-build reference.
+It is useful for maintainers who want to run the lower-level `build-local-package.sh` and `pacman -U` package workflow directly. It is not the primary public install path anymore.
+
 ### Option A: private-venv fallback package
 
 Option A is the larger conservative package that carries a private Python environment under `/opt/far-mesh-quad`.
 
-It remains useful as a fallback while development is active, but the clean-clone validation currently targets Option B.
+It remains useful as a fallback while development is active, but the current validated public install path targets Option B native.
 
 If an Option A package is provided as a release asset or produced locally, install it with:
 
 ```bash
-sudo pacman -U far-mesh-quad-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U far-mesh-quad-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 Run:
 
 ```bash
 far-mesh-quad
-```
-
----
-
-## Clean clone validation
-
-A clean clone has been validated with the following procedure:
-
-```bash
-cd ~/Schreibtisch
-
-git clone https://github.com/Clarke-Projects/FAR-Mesh-Quad.git FAR_Mesh_Quad_clone_test
-
-cd FAR_Mesh_Quad_clone_test
-```
-
-Required payload check:
-
-```bash
-test -f 'bin/Instant Meshes' && echo "OK Instant Meshes"
-test -f bin/quadwild && echo "OK quadwild"
-test -d bin/config && echo "OK bin/config"
-test -d quadwild-bimdf && echo "OK quadwild-bimdf"
-test -f 'packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst' && echo "OK Open3D prebuilt"
-test -d packaging/native/wgpu-stack/packages && echo "OK WGPU package folder"
-test -f packaging/native/far-mesh-quad-native/PKGBUILD && echo "OK PKGBUILD"
-test -f packaging/native/far-mesh-quad-native/build-local-package.sh && echo "OK build script"
-```
-
-Vendored native dependencies:
-
-```bash
-sudo pacman -U --needed \
-  'packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst' \
-  packaging/native/wgpu-stack/packages/*.pkg.tar.zst
-```
-
-Native package build:
-
-```bash
-cd packaging/native/far-mesh-quad-native
-bash build-local-package.sh
-```
-
-Install and launch:
-
-```bash
-sudo pacman -U far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
-far-mesh-quad-native
-```
-
-Validated clean-clone package result:
-
-```text
-Package: far-mesh-quad-native
-Version: 0.1.0-1
-Installed size: approximately 34 MiB
-Package file: far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 ---

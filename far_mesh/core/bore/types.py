@@ -46,6 +46,7 @@ class FeatureFamily(str, Enum):
     BORE = "bore"
     COUNTERBORE = "counterbore"
     STEPPED_BORE_STACK = "stepped_bore_stack"
+    POCKET = "pocket"
     CIRCULAR_POCKET = "circular_pocket"
     HEX_NUT_POCKET = "hex_nut_pocket"
     SLOT_OR_ADJUSTABLE_BORE = "slot_or_adjustable_bore"
@@ -82,6 +83,12 @@ class EvidenceKind(str, Enum):
     SIDE_PAIR = "side_pair"
     FAST_STACK = "fast_stack"
     PROJECTED_RADIUS_ANCHOR = "projected_radius_anchor"
+    POCKET_RIM = "pocket_rim"
+    POCKET_FLOOR = "pocket_floor"
+    POCKET_SIDE_WALL = "pocket_side_wall"
+    POCKET_DEPTH = "pocket_depth"
+    POCKET_TRANSITION = "pocket_transition"
+    POCKET_PROTECTED_BORE_OPENING = "pocket_protected_bore_opening"
 
 
 class FeaturePrimitiveKind(str, Enum):
@@ -98,6 +105,10 @@ class FeaturePrimitiveKind(str, Enum):
     RADIUS_STACK = "radius_stack"
     NONROUND_LOOP_PROFILE = "nonround_loop_profile"
     TESSELLATED_SIDE_PAIR = "tessellated_side_pair"
+    POCKET_RECESS = "pocket_recess"
+    PLANAR_FLOOR = "planar_floor"
+    POCKET_SIDE_WALL_SET = "pocket_side_wall_set"
+    POCKET_FLOOR_BORE_OPENING = "pocket_floor_bore_opening"
     UNKNOWN = "unknown"
 
 
@@ -116,6 +127,7 @@ class FeatureRelationshipKind(str, Enum):
     RADIUS_STACK_MEMBER = "radius_stack_member"
     POSSIBLE_COUNTERBORE_STACK = "possible_counterbore_stack"
     REVIEW_ONLY_ASSEMBLY_RELATIONSHIP = "review_only_assembly_relationship"
+    POCKET_CONTAINS_BORE_OPENING = "pocket_contains_bore_opening"
 
 
 def enum_value(value: object) -> str:

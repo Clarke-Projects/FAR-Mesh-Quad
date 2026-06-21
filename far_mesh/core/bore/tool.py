@@ -28,6 +28,24 @@ from .types import tuple_ints
 
 RGBA = tuple[int, int, int, int]
 DEFAULT_REBUILT_FACE_COLOR: RGBA = (0, 213, 255, 255)
+POST_REBUILD_SELECTION_CLEANUP_CONTRACT = "stale_selection_cleanup_after_mesh_replacement_v1_7_1"
+CANDIDATE_VIEW_REBUILD_AUTHORITY_CONTRACT = "candidate_view_explicit_rebuild_faces_are_rebuild_authority_v1_7_5"
+PLANNED_BORE_REBUILD_OPT_IN_ENV = "FAR_MESH_BORE_REBUILD_PROCESS_TASKS"
+
+
+def _feature_operation_name(candidate: object | None) -> str:
+    """Return a user/log label for the feature family routed through BoreTool."""
+
+    family = str(getattr(candidate, "feature_family", "") or "").strip().lower()
+    entity = str(getattr(candidate, "entity_type", "") or "").strip().lower()
+    if entity == "pocket" or family in {"pocket", "circular_pocket"}:
+        return "POCKET"
+    if entity == "chamfer" or family == "chamfer_form":
+        return "CHAMFER"
+    if entity == "borehole" or family == "bore":
+        return "BORE"
+    return "BoreTool"
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,17 +312,30 @@ def rebuild_bore_candidate(
         raise ValueError(reason)
     if not view.rebuild_face_ids:
         raise ValueError("Bore candidate has no rebuild input face IDs.")
+    _assert_candidate_view_is_rebuild_authority(view)
 
+    # The selected CandidateView is the rebuild authority.  Do not let stale
+    # recognition rows, review-only statuses, display rows, or candidate-index
+    # reselection override these explicit accepted CandidateData fields.
     metadata = dict(view.rebuild_token or {})
-    metadata.setdefault("candidate_id", view.candidate_id)
-    metadata.setdefault("feature_id", view.feature_id)
-    metadata.setdefault("entity_type", view.entity_type)
-    metadata.setdefault("feature_kind", view.feature_kind)
-    metadata.setdefault("feature_family", view.feature_family)
-    metadata.setdefault("recognition_stage", view.recognition_stage)
-    metadata.setdefault("display_face_ids", view.display_face_ids)
-    metadata.setdefault("preview_face_ids", view.display_face_ids)
-    metadata.setdefault("rebuild_face_ids", view.rebuild_face_ids)
+    metadata["selected_candidate_original_status"] = str(metadata.get("status", "") or "")
+    metadata.update({
+        "candidate_id": view.candidate_id,
+        "feature_id": view.feature_id,
+        "entity_type": view.entity_type,
+        "feature_kind": view.feature_kind,
+        "feature_family": view.feature_family,
+        "recognition_stage": view.recognition_stage,
+        "display_face_ids": view.display_face_ids,
+        "preview_face_ids": view.display_face_ids,
+        "rebuild_face_ids": view.rebuild_face_ids,
+        "candidate_action_enabled": True,
+        "can_rebuild": True,
+        "rebuild_authorized": True,
+        "candidate_view_authority_contract": CANDIDATE_VIEW_REBUILD_AUTHORITY_CONTRACT,
+        "candidate_index_authority": False,
+        "semantic_boundary_contract": "CandidateData explicit rebuild_face_ids only; display/preview faces are never rebuild input",
+    })
     metadata["quad_density_mode"] = quad_density_mode
     metadata["rebuild_density_mode"] = quad_density_mode
 
@@ -364,10 +395,14 @@ def _candidate_views_from_recognition(diagnostics: Mapping[str, object]) -> tupl
 
 def _candidate_view_from_raw_feature(raw: Mapping[str, object], *, index: int) -> BoreCandidateView | None:
     display_face_ids = _first_face_ids(raw, ("display_face_ids", "preview_face_ids", "face_ids", "semantic_face_ids"))
-    if not display_face_ids:
+    feature_family_probe = str(raw.get("feature_family", "") or "").strip().lower()
+    frame_only_probe = bool(raw.get("frame_only_candidate", False) or (isinstance(raw.get("diagnostics", {}), Mapping) and bool(raw.get("diagnostics", {}).get("frame_only_candidate", False))))
+    # v1.5.9: a measured two-opening BORE frame can be a valid review row even
+    # when it has no owned display faces.  Do not drop it; just disable preview.
+    if not display_face_ids and not (feature_family_probe == "bore" and frame_only_probe):
         return None
 
-    rebuild_face_ids = _first_face_ids(raw, ("rebuild_face_ids", "candidate_rebuild_face_ids")) or display_face_ids
+    explicit_rebuild_face_ids = _first_face_ids(raw, ("rebuild_face_ids", "candidate_rebuild_face_ids"))
     entity_type = str(raw.get("entity_type", raw.get("feature_kind", "feature")) or "feature").strip().lower() or "feature"
     feature_kind = str(raw.get("feature_kind", entity_type) or entity_type).strip().lower() or entity_type
     candidate_id = str(raw.get("candidate_id", raw.get("feature_id", f"boretool.{entity_type}.{index}")) or f"boretool.{entity_type}.{index}")
@@ -377,9 +412,24 @@ def _candidate_view_from_raw_feature(raw: Mapping[str, object], *, index: int) -
     recognition_stage = str(raw.get("recognition_stage", raw.get("promotion_state", "diagnostic_only")) or "diagnostic_only").strip().lower()
 
     raw_can_rebuild = bool(raw.get("candidate_action_enabled", raw.get("can_rebuild", False) or raw.get("rebuild_authorized", False) or raw.get("rebuild_target_ready", False)))
-    can_rebuild = bool(raw_can_rebuild and recognition_stage == "accepted_candidate" and feature_family in {"bore", "chamfer_form"})
+    # Rebuild routing is only allowed for accepted CandidateData families with
+    # explicit owned rebuild faces.  v39 restores CHAMFER_FORM routing for the
+    # clean chamfer-only recognizer while preserving the v33 semantic boundary:
+    # display/preview faces are still never used as rebuild input.
+    rebuild_supported_families = {"bore", "chamfer_form", "pocket", "circular_pocket"}
+    can_rebuild = bool(raw_can_rebuild and recognition_stage == "accepted_candidate" and feature_family in rebuild_supported_families)
+    rebuild_face_ids = explicit_rebuild_face_ids if can_rebuild else ()
+    if raw_can_rebuild and recognition_stage == "accepted_candidate" and feature_family in rebuild_supported_families and not rebuild_face_ids:
+        can_rebuild = False
     can_preview = bool(display_face_ids)
-    disabled_reason = "" if can_rebuild else str(raw.get("rebuild_block_reason", raw.get("status", "preview-only candidate")) or "preview-only candidate")
+    disabled_reason = "" if can_rebuild else str(
+        raw.get(
+            "rebuild_block_reason",
+            "accepted candidate has no explicit rebuild_face_ids; display faces are not rebuild input"
+            if raw_can_rebuild else raw.get("status", "preview-only candidate"),
+        )
+        or "preview-only candidate"
+    )
 
     geometry = _geometry_text(raw, entity_type=entity_type)
     primitive_rows = _feature_primitive_rows(raw)
@@ -438,7 +488,7 @@ def _candidate_view_from_any(value: BoreCandidateView | Mapping[str, object]) ->
                 table_role=str(value.get("table_role", "rebuildable" if value.get("can_rebuild") else "preview-only") or ""),
                 description=str(value.get("description", "") or ""),
                 display_face_ids=tuple_ints(value.get("display_face_ids", ())),
-                rebuild_face_ids=tuple_ints(value.get("rebuild_face_ids", value.get("display_face_ids", ()))),
+                rebuild_face_ids=tuple_ints(value.get("rebuild_face_ids", ())),
                 can_preview=bool(value.get("can_preview", bool(tuple_ints(value.get("display_face_ids", ())))),),
                 can_rebuild=bool(value.get("can_rebuild", False)),
                 rebuild_disabled_reason=str(value.get("rebuild_disabled_reason", "") or ""),
@@ -446,6 +496,34 @@ def _candidate_view_from_any(value: BoreCandidateView | Mapping[str, object]) ->
             )
         return _candidate_view_from_raw_feature(value, index=1)
     return None
+
+
+def _assert_candidate_view_is_rebuild_authority(view: BoreCandidateView) -> None:
+    """Validate the selected CandidateView before rebuild dispatch.
+
+    This is the BoreTool-side guard for the semantic boundary that failed when
+    a planned rebuild adapter selected/reported a review-only CHAMFER row.
+    Candidate index/order is diagnostic only; rebuild must consume the explicit
+    accepted CandidateView and its owned ``rebuild_face_ids``.
+    """
+
+    stage = str(view.recognition_stage or "").strip().lower()
+    family = str(view.feature_family or "").strip().lower()
+    if stage != "accepted_candidate":
+        raise ValueError(
+            "Selected Bore candidate is not accepted CandidateData; "
+            f"recognition_stage={stage!r}; candidate_id={view.candidate_id!r}."
+        )
+    if family not in {"bore", "chamfer_form", "pocket", "circular_pocket"}:
+        raise ValueError(
+            "Selected Bore candidate family is not rebuild-supported by the active side-wall rebuild trial; "
+            f"feature_family={family!r}; candidate_id={view.candidate_id!r}."
+        )
+    if not tuple_ints(view.rebuild_face_ids):
+        raise ValueError(
+            "Selected accepted CandidateData has no explicit rebuild_face_ids; "
+            "display/preview faces are not rebuild input."
+        )
 
 
 def _first_face_ids(raw: Mapping[str, object], keys: tuple[str, ...]) -> tuple[int, ...]:
@@ -468,6 +546,14 @@ def _geometry_text(raw: Mapping[str, object], *, entity_type: str) -> str:
             _short_number(raw.get("diameter", 0.0)),
             _short_number(raw.get("radius", 0.0)),
             _short_number(raw.get("depth", raw.get("height", raw.get("axial_span", 0.0)))),
+        )
+    if entity_type == "pocket":
+        return "Ø %s  R %s  D %s  floor %s wall %s" % (
+            _short_number(raw.get("diameter", 2.0 * float(raw.get("radius", raw.get("primitive_radius", 0.0)) or 0.0))),
+            _short_number(raw.get("radius", raw.get("primitive_radius", 0.0))),
+            _short_number(raw.get("depth", raw.get("height", raw.get("axial_span", 0.0)))),
+            int(raw.get("pocket_floor_face_count", len(tuple_ints(raw.get("pocket_floor_face_ids", ()))) or 0) or 0),
+            int(raw.get("pocket_side_wall_face_count", len(tuple_ints(raw.get("pocket_side_wall_face_ids", ()))) or 0) or 0),
         )
     return "R %s" % _short_number(raw.get("radius", raw.get("mouth_radius", 0.0)))
 
@@ -548,7 +634,40 @@ def _candidate_description(raw: Mapping[str, object], *, display_face_ids: tuple
                     relation.get("role", "-"),
                 )
             )
-    for key in ("feature_family", "recognition_stage", "evidence_kinds", "promotion_reasons", "rejection_reasons", "feature_primitive_count", "feature_relationship_count", "x1_primitive_bridge_contract", "rebuild_target_policy_allowed", "rebuild_target_policy_reason", "delete_patch_request_allowed", "status", "promotion_state", "role", "candidate_action_enabled", "candidate_action", "rebuild_disabled_reason", "surface_condition", "repair_strategy", "confidence", "radius", "diameter", "depth", "height", "axial_span"):
+    for key in (
+        "feature_family", "recognition_stage", "evidence_kinds", "promotion_reasons", "rejection_reasons",
+        "feature_primitive_count", "feature_relationship_count", "x1_primitive_bridge_contract",
+        "rebuild_target_policy_allowed", "rebuild_target_policy_reason", "delete_patch_request_allowed",
+        "heuristic_contract_version", "heuristic_recipe_name", "heuristic_authority_policy",
+        "status", "promotion_state", "role", "candidate_action_enabled", "candidate_action", "rebuild_disabled_reason",
+        "surface_condition", "repair_strategy", "confidence", "radius", "diameter", "depth", "height", "axial_span",
+        # POCKET preview-only recognition fields.
+        "pocket_kind", "pocket_floor_face_count", "pocket_side_wall_face_count", "pocket_transition_face_count",
+        "pocket_depth", "pocket_footprint_radius", "pocket_side_wall_coverage", "pocket_rebuild_enable_scope",
+        # v1.5.5 wall-ownership report fields.
+        "preview_source", "bore_wall_ownership_reject_reason", "bore_wall_component_rejection_reasons",
+        "wall_span_fraction_of_two_opening_depth", "strict_wall_band_ratio", "radial_rel_mad", "radial_abs_mad",
+        "normal_axis_abs_median", "radial_normal_alignment_median", "touches_selected_opening", "touches_opposite_opening",
+        "touches_both_openings", "min_distance_to_selected_opening", "min_distance_to_opposite_opening",
+        "opening_touch_tolerance", "selected_opening_primary_edge_count", "selected_opening_support_weak",
+        "two_opening_axis_direction_preserved", "two_opening_axis_dot_opening_to_opposite", "bore_axis_source",
+        "sidewall_normal_evidence_count", "frame_sidewall_normal_evidence_count", "broad_sidewall_normal_evidence_count",
+        "bore_wall_interior_margin", "bore_wall_broad_radial_min", "bore_wall_broad_radial_max",
+        "learned_wall_radius", "learned_wall_radius_source",
+        "semantic_aggregate_sidewall_ownership_used", "aggregate_wall_face_count", "aggregate_wall_axial_coverage",
+        "aggregate_wall_axial_span", "aggregate_wall_centroid_axial_span", "face_span_axial_ownership_used",
+        "aggregate_wall_angular_coverage", "aggregate_wall_rejection_reasons",
+        "measured_two_opening_frame_depth", "owned_bore_frame_depth", "owned_bore_frame_depth_delta",
+        "owned_frame_reconciled_from_wall_ownership", "owned_wall_face_span_depth",
+        "owned_wall_axial_min", "owned_wall_axial_max", "region_true_endpoint_depth",
+        "true_endpoint_depth_candidate", "true_endpoint_depth_gap",
+        "true_endpoint_reconcile_epsilon", "true_endpoint_max_extension",
+        "true_endpoint_reconciled_from_region_endpoint", "endpoint_support_face_count",
+        "terminal_wall_candidate_face_count", "terminal_wall_face_count", "terminal_wall_completion_used",
+        "terminal_wall_completion_rejection_reasons", "true_endpoint_extension_added_face_count",
+        "candidate_face_policy", "bore_frame_depth_source",
+        "two_opening_search_boundary_face_count", "bore_wall_search_face_count", "bore_wall_candidate_component_count",
+    ):
         if key in raw:
             lines.append(f"{key}: {raw[key]}")
     ledger = raw.get("x1_evidence_ledger")
@@ -598,6 +717,51 @@ def _routed_outputs_text(
         f"  boundary_loop_count: {diagnostics.get('boundary_loop_count', '-')}",
         f"  volumetric_anchor_policy: {diagnostics.get('volumetric_anchor_policy', '-')}",
         f"  primary_anchor_edge_count: {diagnostics.get('primary_anchor_edge_count', '-')}",
+    ]
+    opening_audit = diagnostics.get("selected_opening_measurement_audit")
+    if isinstance(opening_audit, Mapping):
+        lines.extend([
+            "1b. Selected-opening measurement audit:",
+            f"  audit_status: {opening_audit.get('audit_status', '-')}",
+            f"  raw selected edges: {opening_audit.get('raw_selected_edge_count', '-')}",
+            f"  normalized rim edges: {opening_audit.get('normalized_rim_edge_count', '-')}",
+            f"  normalized/raw ratio: {opening_audit.get('normalized_to_raw_edge_ratio', '-')}",
+            f"  raw candidates: {opening_audit.get('raw_candidate_count', '-')}",
+            f"  normalized candidates: {opening_audit.get('normalized_candidate_count', '-')}",
+            f"  raw best radius/conf: {opening_audit.get('raw_best_radius', '-')} / {opening_audit.get('raw_best_confidence', '-')}",
+            f"  normalized best radius/conf: {opening_audit.get('normalized_best_radius', '-')} / {opening_audit.get('normalized_best_confidence', '-')}",
+            f"  raw-vs-normalized agree: {opening_audit.get('raw_vs_normalized_measurement_agree', '-')}",
+            f"  collapse suspected: {opening_audit.get('normalized_rim_collapse_suspected', '-')}",
+        ])
+        resolver = opening_audit.get("selected_opening_frame_resolver")
+        if isinstance(resolver, Mapping):
+            lines.extend([
+                "1c. Selected-opening frame resolver:",
+                f"  resolver_status: {resolver.get('resolver_status', '-')}",
+                f"  resolved: {resolver.get('resolved', '-')}",
+                f"  source: {resolver.get('resolver_source', '-')}",
+                f"  radius/conf: {resolver.get('radius', '-')} / {resolver.get('confidence', '-')}",
+                f"  edge_count: {resolver.get('edge_count', '-')}",
+                f"  score: {resolver.get('score', resolver.get('best_score', '-'))}",
+                f"  axis_dot_to_region: {resolver.get('axis_abs_dot_to_region', resolver.get('best_axis_abs_dot_to_region', '-'))}",
+                f"  radius_delta_rel_to_region: {resolver.get('radius_delta_rel_to_region', resolver.get('best_radius_delta_rel_to_region', '-'))}",
+                f"  centerline_distance_to_region: {resolver.get('centerline_distance_to_region', resolver.get('best_centerline_distance_to_region', '-'))}",
+            ])
+        two_frame = opening_audit.get("two_opening_bore_frame")
+        if isinstance(two_frame, Mapping):
+            two_diag = two_frame.get("diagnostics", {})
+            if not isinstance(two_diag, Mapping):
+                two_diag = {}
+            lines.extend([
+                "1d. Two-opening BORE frame measurement:",
+                f"  valid: {two_frame.get('valid', '-')}",
+                f"  status: {two_frame.get('status', '-')}",
+                f"  radius: {two_frame.get('radius', '-')}",
+                f"  depth: {two_frame.get('depth', '-')}",
+                f"  opposite_opening_found: {two_diag.get('opposite_opening_found', '-')}",
+                f"  opposite_candidate_count: {two_diag.get('opposite_candidate_count', '-')}",
+            ])
+    lines.extend([
         "2. Recognition / CandidateData output:",
         f"  measured patch faces: {feature_patch.get('face_count', '-')}",
         f"  measured radius: {feature_patch.get('radius', '-')}",
@@ -612,6 +776,117 @@ def _routed_outputs_text(
         f"  borehole_face_count: {engine.get('borehole_face_count', '-')}",
         f"  unclassified_face_count: {engine.get('unclassified_face_count', '-')}",
         f"  candidate_isolation_policy: {engine.get('candidate_isolation_policy', '-')}",
+        f"  heuristic_contract_version: {engine.get('heuristic_contract_version', '-')}",
+        f"  heuristic_authority_policy: {engine.get('heuristic_authority_policy', '-')}",
+        f"  bore_heuristic_recipe: {engine.get('bore_heuristic_recipe', '-')}",
+        f"  heuristic_result_count: {len(tuple(engine.get('heuristic_results', ()) or ())) if not isinstance(engine.get('heuristic_results', ()), str) else '-'}",
+        f"  two_opening_bore_frame_valid: {engine.get('two_opening_bore_frame_valid', '-')}",
+        f"  two_opening_bore_frame_depth: {engine.get('two_opening_bore_frame_depth', '-')}",
+        f"  two_opening_axis_direction_preserved: {engine.get('two_opening_axis_direction_preserved', '-')}",
+        f"  two_opening_axis_dot_opening_to_opposite: {engine.get('two_opening_axis_dot_opening_to_opposite', '-')}",
+        f"  bore_axis_source: {engine.get('bore_axis_source', '-')}",
+        f"  sidewall_normal_evidence_count: {engine.get('sidewall_normal_evidence_count', '-')}",
+        f"  frame_sidewall_normal_evidence_count: {engine.get('frame_sidewall_normal_evidence_count', '-')}",
+        f"  broad_sidewall_normal_evidence_count: {engine.get('broad_sidewall_normal_evidence_count', '-')}",
+        f"  bore_wall_interior_margin: {engine.get('bore_wall_interior_margin', '-')}",
+        f"  bore_wall_broad_radial_min/max: {engine.get('bore_wall_broad_radial_min', '-')} / {engine.get('bore_wall_broad_radial_max', '-')}",
+        f"  learned_wall_radius: {engine.get('learned_wall_radius', '-')}",
+        f"  learned_wall_radius_source: {engine.get('learned_wall_radius_source', '-')}",
+        f"  semantic_aggregate_sidewall_ownership_used: {engine.get('semantic_aggregate_sidewall_ownership_used', '-')}",
+        f"  aggregate_wall_face_count: {engine.get('aggregate_wall_face_count', '-')}",
+        f"  aggregate_wall_axial_coverage/span: {engine.get('aggregate_wall_axial_coverage', '-')} / {engine.get('aggregate_wall_axial_span', '-')}",
+        f"  aggregate_wall_centroid_span: {engine.get('aggregate_wall_centroid_axial_span', '-')}",
+        f"  face_span_axial_ownership_used: {engine.get('face_span_axial_ownership_used', '-')}",
+        f"  aggregate_wall_angular_coverage: {engine.get('aggregate_wall_angular_coverage', '-')}",
+        f"  aggregate_wall_rejection_reasons: {engine.get('aggregate_wall_rejection_reasons', '-')}",
+        f"  measured/owned frame depth: {engine.get('measured_two_opening_frame_depth', '-')} / {engine.get('owned_bore_frame_depth', '-')}",
+        f"  owned frame depth delta: {engine.get('owned_bore_frame_depth_delta', '-')}",
+        f"  owned_frame_reconciled_from_wall_ownership: {engine.get('owned_frame_reconciled_from_wall_ownership', '-')}",
+        f"  owned wall axial min/max/span: {engine.get('owned_wall_axial_min', '-')} / {engine.get('owned_wall_axial_max', '-')} / {engine.get('owned_wall_face_span_depth', '-')}",
+        f"  region_true_endpoint_depth: {engine.get('region_true_endpoint_depth', '-')}",
+        f"  true endpoint depth/gap: {engine.get('true_endpoint_depth_candidate', '-')} / {engine.get('true_endpoint_depth_gap', '-')}",
+        f"  true endpoint epsilon/max_extension: {engine.get('true_endpoint_reconcile_epsilon', '-')} / {engine.get('true_endpoint_max_extension', '-')}",
+        f"  true_endpoint_reconciled_from_region_endpoint: {engine.get('true_endpoint_reconciled_from_region_endpoint', '-')}",
+        f"  endpoint_support_face_count: {engine.get('endpoint_support_face_count', '-')}",
+        f"  terminal_wall_candidate/owned/added: {engine.get('terminal_wall_candidate_face_count', '-')} / {engine.get('terminal_wall_face_count', '-')} / {engine.get('true_endpoint_extension_added_face_count', '-')}",
+        f"  terminal_wall_completion_used: {engine.get('terminal_wall_completion_used', '-')}",
+        f"  candidate_face_policy: {engine.get('candidate_face_policy', '-')}",
+        f"  bore_frame_depth_source: {engine.get('bore_frame_depth_source', '-')}",
+        f"  two_opening_search_boundary_face_count: {engine.get('two_opening_search_boundary_face_count', '-')}",
+        f"  bore_wall_search_face_count: {engine.get('bore_wall_search_face_count', '-')}",
+        f"  bore_wall_candidate_component_count: {engine.get('two_opening_bore_wall_candidate_component_count', engine.get('bore_wall_candidate_component_count', '-'))}",
+        f"  bore_wall_ownership_valid: {engine.get('bore_wall_ownership_valid', '-')}",
+        f"  bore_wall_owned_face_count: {engine.get('bore_wall_owned_face_count', '-')}",
+        f"  bore_wall_rejected_component_count: {engine.get('bore_wall_rejected_component_count', '-')}",
+        f"  bore_wall_component_rejection_reasons: {engine.get('bore_wall_component_rejection_reasons', '-')}",
+        f"  best_wall_candidate_face_count: {engine.get('best_wall_candidate_face_count', '-')}",
+        f"  heuristic_result_summaries: {engine.get('heuristic_result_summaries', '-')}",
+        f"  v25_semantic_role_trace_used: {engine.get('v25_semantic_role_trace_used', '-')}",
+        f"  v26_selected_bore_wall_membership_used: {engine.get('v26_selected_bore_wall_membership_used', '-')}",
+        f"  v26_raw_wall_face_count: {engine.get('v26_raw_wall_face_count', '-')}",
+        f"  v26_selected_wall_face_count: {engine.get('v26_selected_wall_face_count', '-')}",
+        f"  v26_removed_context_wall_face_count: {engine.get('v26_removed_context_wall_face_count', '-')}",
+        f"  v26_promoted_wall_component_count: {engine.get('v26_promoted_wall_component_count', '-')}",
+        f"  v26_context_wall_component_count: {engine.get('v26_context_wall_component_count', '-')}",
+        f"  v27_selected_bore_centerline_membership_used: {engine.get('v27_selected_bore_centerline_membership_used', '-')}",
+        f"  v27_centerline_tolerance: {engine.get('v27_centerline_tolerance', '-')}",
+        f"  v27_centerline_fit_reliable_component_count: {engine.get('v27_centerline_fit_reliable_component_count', '-')}",
+        f"  v27_centerline_family_pass_component_count: {engine.get('v27_centerline_family_pass_component_count', '-')}",
+        f"  v27_centerline_family_rejected_component_count: {engine.get('v27_centerline_family_rejected_component_count', '-')}",
+        f"  v27_direct_anchor_component_count: {engine.get('v27_direct_anchor_component_count', '-')}",
+        f"  v27_opening_anchor_component_count: {engine.get('v27_opening_anchor_component_count', '-')}",
+        f"  v27_fragment_extension_component_count: {engine.get('v27_fragment_extension_component_count', '-')}",
+        f"  v27_centerline_rejected_face_count: {engine.get('v27_centerline_rejected_face_count', '-')}",
+        f"  v28_primary_opening_anchor_membership_used: {engine.get('v28_primary_opening_anchor_membership_used', '-')}",
+        f"  v28_primary_anchor_component_count: {engine.get('v28_primary_anchor_component_count', '-')}",
+        f"  v28_primary_anchor_face_count: {engine.get('v28_primary_anchor_face_count', '-')}",
+        f"  v28_direct_anchor_candidate_count: {engine.get('v28_direct_anchor_candidate_count', '-')}",
+        f"  v28_direct_anchor_promoted_count: {engine.get('v28_direct_anchor_promoted_count', '-')}",
+        f"  v28_direct_anchor_rejected_count: {engine.get('v28_direct_anchor_rejected_count', '-')}",
+        f"  v28_seed_contact_rejected_face_count: {engine.get('v28_seed_contact_rejected_face_count', '-')}",
+        f"  v29_axial_continuation_membership_used: {engine.get('v29_axial_continuation_membership_used', '-')}",
+        f"  v29_axial_continuation_gap: {engine.get('v29_axial_continuation_gap', '-')}",
+        f"  v29_axial_completion_candidate_count: {engine.get('v29_axial_completion_candidate_count', '-')}",
+        f"  v29_axial_completion_promoted_count: {engine.get('v29_axial_completion_promoted_count', '-')}",
+        f"  v29_axial_completion_rejected_count: {engine.get('v29_axial_completion_rejected_count', '-')}",
+        f"  v29_axial_completion_added_faces: {engine.get('v29_axial_completion_added_faces', '-')}",
+        f"  v29_axial_completion_final_face_count: {engine.get('v29_axial_completion_final_face_count', '-')}",
+        f"  v30_measured_depth_bounded_continuation_used: {engine.get('v30_measured_depth_bounded_continuation_used', '-')}",
+        f"  v30_depth_interval_source: {engine.get('v30_depth_interval_source', '-')}",
+        f"  v30_measured_depth: {engine.get('v30_measured_depth', '-')}",
+        f"  v30_measured_depth_min: {engine.get('v30_measured_depth_min', '-')}",
+        f"  v30_measured_depth_max: {engine.get('v30_measured_depth_max', '-')}",
+        f"  v30_candidate_would_expand_depth_rejected_count: {engine.get('v30_candidate_would_expand_depth_rejected_count', '-')}",
+        f"  v30_remote_fragment_rejected_faces: {engine.get('v30_remote_fragment_rejected_faces', '-')}",
+        f"  v30_depth_bounded_added_faces: {engine.get('v30_depth_bounded_added_faces', '-')}",
+        f"  v30_depth_bounded_final_face_count: {engine.get('v30_depth_bounded_final_face_count', '-')}",
+        f"  v32_measured_bore_hypothesis_surface_completion_used: {engine.get('v32_measured_bore_hypothesis_surface_completion_used', '-')}",
+        f"  v32_hypothesis_radius: {engine.get('v32_hypothesis_radius', '-')}",
+        f"  v32_hypothesis_depth: {engine.get('v32_hypothesis_depth', '-')}",
+        f"  v32_surface_candidate_component_count: {engine.get('v32_surface_candidate_component_count', '-')}",
+        f"  v32_surface_promoted_component_count: {engine.get('v32_surface_promoted_component_count', '-')}",
+        f"  v32_surface_added_faces: {engine.get('v32_surface_added_faces', '-')}",
+        f"  v32_surface_final_face_count: {engine.get('v32_surface_final_face_count', '-')}",
+        f"  v34_trace_owned_face_count: {engine.get('v34_trace_owned_face_count', '-')}",
+        f"  v35_continuation_added_faces: {engine.get('v35_continuation_added_faces', '-')}",
+        f"  v36_unwrap_added_faces: {engine.get('v36_unwrap_added_faces', '-')}",
+        f"  v36_unwrap_angular_coverage_before: {engine.get('v36_unwrap_angular_coverage_before', '-')}",
+        f"  v36_unwrap_angular_coverage_after: {engine.get('v36_unwrap_angular_coverage_after', '-')}",
+        f"  v37_theta_authority: {engine.get('v37_theta_authority', '-')}",
+        f"  v37_mouth_theta_coverage: {engine.get('v37_mouth_theta_coverage', '-')}",
+        f"  v37_start_cell_count: {engine.get('v37_start_cell_count', '-')}",
+        f"  v37_added_faces: {engine.get('v37_added_faces', '-')}",
+        f"  v37_final_face_count: {engine.get('v37_final_face_count', '-')}",
+        f"  v37_final_component_count: {engine.get('v37_final_component_count', '-')}",
+        f"  wall_band_face_count: {engine.get('wall_band_face_count', '-')}",
+        f"  strict_wall_mask_face_count: {engine.get('strict_wall_mask_face_count', '-')}",
+        f"  medium_wall_mask_face_count: {engine.get('medium_wall_mask_face_count', '-')}",
+        f"  owned_wall_face_count: {engine.get('owned_wall_face_count', '-')}",
+        f"  owned_wall_seed_overlap: {engine.get('owned_wall_seed_overlap', '-')}",
+        f"  wall_component_count: {engine.get('wall_component_count', '-')}",
+        f"  transition_component_count: {engine.get('transition_component_count', '-')}",
+        f"  identity_support_face_count: {engine.get('identity_support_face_count', '-')}",
+        f"  unowned_context_face_count: {engine.get('unowned_context_face_count', '-')}",
         f"  density_bias_guard_used: {engine.get('density_bias_guard_used', '-')}",
         f"  raw_face_count_score_weight: {engine.get('raw_face_count_score_weight', '-')}",
         f"  geometric_band_score_weight: {engine.get('geometric_band_score_weight', '-')}",
@@ -622,7 +897,33 @@ def _routed_outputs_text(
         f"  chamfer_completion_added_faces: {engine.get('chamfer_completion_added_face_count', '-')}",
         f"  chamfer_completion_used_groups: {engine.get('chamfer_completion_used_group_count', '-')}",
         "4. CandidateView output:",
-    ]
+    ])
+    # v1.5.5: make wall ownership component reports visible in the routed text.
+    candidate_header = lines.pop() if lines and lines[-1] == "4. CandidateView output:" else "4. CandidateView output:"
+    wall_reports = engine.get("bore_wall_component_reports", ())
+    if isinstance(wall_reports, (list, tuple)) and wall_reports:
+        lines.append("3b. Bore wall ownership component reports:")
+        for ridx, report in enumerate(tuple(wall_reports)[:8], start=1):
+            if not isinstance(report, Mapping):
+                continue
+            lines.append(
+                "  [%d] faces=%s span=%s coverage=%s strict=%s radial_mad=%s normal_axis=%s radial_align=%s touchA=%s touchB=%s reason=%s"
+                % (
+                    ridx,
+                    report.get("face_count", "-"),
+                    report.get("axial_span", "-"),
+                    report.get("wall_span_fraction_of_two_opening_depth", "-"),
+                    report.get("strict_wall_band_ratio", "-"),
+                    report.get("radial_rel_mad", "-"),
+                    report.get("normal_axis_abs_median", "-"),
+                    report.get("radial_normal_alignment_median", "-"),
+                    report.get("touches_selected_opening", "-"),
+                    report.get("touches_opposite_opening", "-"),
+                    report.get("rejection_reasons", report.get("reject_reason", "-")),
+                )
+            )
+    lines.append(candidate_header)
+
     if candidates:
         for idx, candidate in enumerate(candidates, start=1):
             token = dict(candidate.rebuild_token or {})
@@ -658,6 +959,130 @@ def _routed_outputs_text(
                 "geometric_band_score",
                 "density_normalized_face_score",
                 "excluded_chamfer_face_count",
+                "v25_semantic_role_trace_used",
+                "v26_selected_bore_wall_membership_used",
+                "v26_raw_wall_face_count",
+                "v26_selected_wall_face_count",
+                "v26_removed_context_wall_face_count",
+                "v26_promoted_wall_component_count",
+                "v26_context_wall_component_count",
+                "v26_wall_membership_fallback_used",
+                "v26_wall_membership_fallback_reason",
+                "v27_selected_bore_centerline_membership_used",
+                "v27_centerline_tolerance",
+                "v27_centerline_fit_reliable_component_count",
+                "v27_centerline_family_pass_component_count",
+                "v27_centerline_family_rejected_component_count",
+                "v27_direct_anchor_component_count",
+                "v27_opening_anchor_component_count",
+                "v27_fragment_extension_component_count",
+                "v27_centerline_rejected_face_count",
+                "v28_primary_opening_anchor_membership_used",
+                "v28_primary_anchor_component_count",
+                "v28_primary_anchor_face_count",
+                "v28_direct_anchor_candidate_count",
+                "v28_direct_anchor_promoted_count",
+                "v28_direct_anchor_rejected_count",
+                "v28_centerline_promoted_component_count",
+                "v28_fragment_promoted_component_count",
+                "v28_seed_contact_rejected_face_count",
+                "v29_axial_continuation_membership_used",
+                "v29_axial_continuation_gap",
+                "v29_axial_completion_candidate_count",
+                "v29_axial_completion_promoted_count",
+                "v29_axial_completion_rejected_count",
+                "v29_axial_completion_added_faces",
+                "v29_axial_completion_added_component_count",
+                "v29_axial_completion_final_face_count",
+                "v29_axial_completion_final_component_count",
+                "v29_rejected_as_centerline_contradiction_count",
+                "v29_rejected_as_opening_plane_context_count",
+                "v30_measured_depth_bounded_continuation_used",
+                "v30_depth_bound_used",
+                "v30_depth_interval_source",
+                "v30_measured_depth_min",
+                "v30_measured_depth_max",
+                "v30_measured_depth",
+                "v30_depth_padding",
+                "v30_corridor_gap_tolerance",
+                "v30_compatible_boundary_loop_count",
+                "v30_selected_opposite_loop_index",
+                "v30_selected_opposite_loop_axial",
+                "v30_candidate_would_expand_depth_rejected_count",
+                "v30_remote_fragment_rejected_count",
+                "v30_remote_fragment_rejected_faces",
+                "v30_depth_bounded_candidate_count",
+                "v30_depth_bounded_promoted_count",
+                "v30_depth_bounded_rejected_count",
+                "v30_depth_bounded_added_faces",
+                "v30_depth_bounded_final_face_count",
+                "v30_depth_bounded_final_component_count",
+                "v32_measured_bore_hypothesis_surface_completion_used",
+                "v32_membership_policy",
+                "v32_hypothesis_radius",
+                "v32_hypothesis_depth_min",
+                "v32_hypothesis_depth_max",
+                "v32_hypothesis_depth",
+                "v32_surface_radial_tolerance",
+                "v32_surface_radial_mad_tolerance",
+                "v32_surface_score_threshold",
+                "v32_surface_candidate_component_count",
+                "v32_surface_promoted_component_count",
+                "v32_surface_added_component_count",
+                "v32_surface_added_faces",
+                "v32_surface_final_face_count",
+                "v32_surface_final_component_count",
+            "v34_selected_opening_interior_wall_trace_used",
+            "v34_trace_seed_face_count",
+            "v34_trace_owned_face_count",
+            "v34_trace_added_face_count",
+            "v34_trace_component_count",
+            "v35_measured_interior_wall_continuation_used",
+            "v35_owned_seed_face_count",
+            "v35_continuation_candidate_component_count",
+            "v35_continuation_promoted_component_count",
+            "v35_continuation_added_faces",
+            "v35_continuation_final_face_count",
+            "v35_continuation_final_component_count",
+            "v36_cylindrical_unwrap_surface_completion_used",
+            "v36_unwrap_seed_face_count",
+            "v36_unwrap_eligible_face_count",
+            "v36_unwrap_seed_cell_count",
+            "v36_unwrap_accepted_cell_count",
+            "v36_unwrap_added_faces",
+            "v36_unwrap_final_face_count",
+            "v36_unwrap_final_component_count",
+            "v36_unwrap_theta_bin_count",
+            "v36_unwrap_axial_bin_count",
+            "v36_unwrap_angular_coverage_before",
+            "v36_unwrap_angular_coverage_after",
+            "v36_unwrap_completion_limited_by_continuity_budget",
+            "v37_selected_opening_angular_mouth_completion_used",
+            "v37_theta_authority",
+            "v37_mouth_seed_face_count",
+            "v37_mouth_seed_cell_count",
+            "v37_mouth_theta_bin_count",
+            "v37_mouth_theta_coverage",
+            "v37_effective_theta_bin_count",
+            "v37_mouth_axial_seed_bin_count",
+            "v37_start_cell_count",
+            "v37_eligible_face_count",
+            "v37_accepted_cell_count",
+            "v37_added_faces",
+            "v37_final_face_count",
+            "v37_final_component_count",
+            "v37_completion_limited_by_budget",
+            "v37_seed_axial_center",
+            "v37_mouth_axial_window",
+                "wall_band_face_count",
+                "strict_wall_mask_face_count",
+                "medium_wall_mask_face_count",
+                "owned_wall_face_count",
+                "owned_wall_seed_overlap",
+                "wall_component_count",
+                "transition_component_count",
+                "identity_support_face_count",
+                "unowned_context_face_count",
             ):
                 if key in token:
                     lines.append(f"      {key}: {token[key]}")
@@ -758,14 +1183,24 @@ def _region_preview_face_ids_from_region(region: object, diagnostics: Mapping[st
 
 
 def _normalized_edge_ids_from_diagnostics(diagnostics: Mapping[str, object], selected_edge_ids: tuple[int, ...]) -> tuple[int, ...]:
+    """Return Region Select's authoritative normalized opening/rim edge IDs.
+
+    Raw viewport Ctrl-click selection is only initial evidence.  Region Select
+    may infer the complete neutral opening/rim loop from that evidence and
+    exposes it as ``cutout["opening_rim_edge_ids"]``.  The BoreTool facade
+    must cache/report that normalized rim before falling back to raw selection.
+    """
+
     cutout = diagnostics.get("cutout", {})
     if isinstance(cutout, Mapping):
-        ids = tuple_ints(cutout.get("selected_edge_ids", ()))
+        for key in ("opening_rim_edge_ids", "normalized_opening_rim_edge_ids", "selected_edge_ids"):
+            ids = tuple_ints(cutout.get(key, ()))
+            if ids:
+                return ids
+    for key in ("opening_rim_edge_ids", "normalized_opening_rim_edge_ids", "selected_edge_ids"):
+        ids = tuple_ints(diagnostics.get(key, ()))
         if ids:
             return ids
-    ids = tuple_ints(diagnostics.get("selected_edge_ids", ()))
-    if ids:
-        return ids
     return selected_edge_ids
 
 
@@ -827,12 +1262,211 @@ def format_bore_diagnostics(diagnostics: Mapping[str, object] | object) -> str:
             if key in feature_patch:
                 lines.append(f"  {key}: {feature_patch[key]}")
 
+    opening_audit = diagnostics.get("selected_opening_measurement_audit")
+    if isinstance(opening_audit, Mapping):
+        lines.append("selected opening measurement audit:")
+        for key in (
+            "audit_status",
+            "raw_selected_edge_count",
+            "normalized_rim_edge_count",
+            "normalized_to_raw_edge_ratio",
+            "raw_candidate_count",
+            "normalized_candidate_count",
+            "raw_component_candidate_count",
+            "raw_best_radius",
+            "normalized_best_radius",
+            "raw_component_best_radius",
+            "raw_best_confidence",
+            "normalized_best_confidence",
+            "raw_component_best_confidence",
+            "raw_vs_normalized_radius_delta_rel",
+            "raw_vs_normalized_axis_abs_dot",
+            "raw_vs_normalized_centerline_distance",
+            "raw_vs_normalized_measurement_agree",
+            "normalized_rim_collapse_suspected",
+            "raw_selection_severe_fragmentation_suspected",
+            "normalized_rim_low_support_suspected",
+            "selected_opening_frame_resolved",
+            "resolved_opening_seed_face_count",
+            "resolved_opening_primary_edge_count",
+            "resolved_opening_expanded_edge_count",
+            "selected_opening_seed_island_source",
+        ):
+            if key in opening_audit:
+                lines.append(f"  {key}: {opening_audit[key]}")
+        resolver = opening_audit.get("selected_opening_frame_resolver")
+        if isinstance(resolver, Mapping):
+            lines.append("selected opening frame resolver:")
+            for key in (
+                "resolver_status",
+                "resolved",
+                "resolver_source",
+                "radius",
+                "confidence",
+                "edge_count",
+                "primary_edge_count",
+                "expanded_edge_count",
+                "seed_island_authority",
+                "score",
+                "axis_abs_dot_to_region",
+                "radius_delta_rel_to_region",
+                "centerline_distance_to_region",
+                "best_score",
+                "best_axis_abs_dot_to_region",
+                "best_radius_delta_rel_to_region",
+                "best_centerline_distance_to_region",
+            ):
+                if key in resolver:
+                    lines.append(f"  {key}: {resolver[key]}")
+        two_frame = opening_audit.get("two_opening_bore_frame")
+        if isinstance(two_frame, Mapping):
+            lines.append("two-opening BORE frame measurement:")
+            for key in ("valid", "status", "semantic_stage", "radius", "diameter", "depth", "confidence", "opening_center", "opposite_center", "axis"):
+                if key in two_frame:
+                    lines.append(f"  {key}: {two_frame[key]}")
+            two_diag = two_frame.get("diagnostics", {})
+            if isinstance(two_diag, Mapping):
+                for key in ("opposite_opening_found", "opposite_candidate_count", "boundary_loop_count", "rejection_reason", "best_opposite_candidate"):
+                    if key in two_diag:
+                        lines.append(f"  {key}: {two_diag[key]}")
+
     engine = diagnostics.get("component_engine_diagnostics")
     if isinstance(engine, Mapping):
         lines.append("component engine:")
         for key in (
             "component_engine_version",
             "region_face_count",
+            "v140_two_opening_bore_measurement_used",
+            "two_opening_bore_frame_valid",
+            "two_opening_bore_frame_status",
+            "two_opening_bore_frame_depth",
+            "v137_selected_opening_seed_island_isolation_used",
+            "selected_opening_frame_resolver_status",
+            "selected_opening_frame_resolved",
+            "selected_opening_frame_source",
+            "resolved_opening_seed_face_count",
+            "selected_opening_primary_seed_face_count",
+            "selected_opening_expanded_seed_face_count",
+            "selected_opening_seed_island_source",
+            "v132_selected_opening_measurement_audit_used",
+            "opening_measurement_audit_status",
+            "raw_opening_candidate_count",
+            "normalized_opening_candidate_count",
+            "raw_best_opening_radius",
+            "normalized_best_opening_radius",
+            "raw_vs_normalized_opening_measurement_agree",
+            "normalized_rim_collapse_suspected",
+            "raw_selection_severe_fragmentation_suspected",
+            "normalized_rim_low_support_suspected",
+            "v25_semantic_role_trace_used",
+            "v26_selected_bore_wall_membership_used",
+            "v26_raw_wall_face_count",
+            "v26_selected_wall_face_count",
+            "v26_removed_context_wall_face_count",
+            "v26_promoted_wall_component_count",
+            "v26_context_wall_component_count",
+            "v26_wall_membership_fallback_used",
+            "v26_wall_membership_fallback_reason",
+            "v27_selected_bore_centerline_membership_used",
+            "v27_centerline_tolerance",
+            "v27_centerline_fit_reliable_component_count",
+            "v27_centerline_family_pass_component_count",
+            "v27_centerline_family_rejected_component_count",
+            "v27_direct_anchor_component_count",
+            "v27_opening_anchor_component_count",
+            "v27_fragment_extension_component_count",
+            "v27_centerline_rejected_face_count",
+            "v28_primary_opening_anchor_membership_used",
+            "v28_primary_anchor_component_count",
+            "v28_primary_anchor_face_count",
+            "v28_direct_anchor_candidate_count",
+            "v28_direct_anchor_promoted_count",
+            "v28_direct_anchor_rejected_count",
+            "v28_centerline_promoted_component_count",
+            "v28_fragment_promoted_component_count",
+            "v28_seed_contact_rejected_face_count",
+            "v29_axial_continuation_membership_used",
+            "v29_axial_continuation_gap",
+            "v29_axial_completion_candidate_count",
+            "v29_axial_completion_promoted_count",
+            "v29_axial_completion_rejected_count",
+            "v29_axial_completion_added_faces",
+            "v29_axial_completion_added_component_count",
+            "v29_axial_completion_final_face_count",
+            "v29_axial_completion_final_component_count",
+            "v29_rejected_as_centerline_contradiction_count",
+            "v29_rejected_as_opening_plane_context_count",
+            "v30_measured_depth_bounded_continuation_used",
+            "v30_depth_bound_used",
+            "v30_depth_interval_source",
+            "v30_measured_depth_min",
+            "v30_measured_depth_max",
+            "v30_measured_depth",
+            "v30_depth_padding",
+            "v30_corridor_gap_tolerance",
+            "v30_compatible_boundary_loop_count",
+            "v30_selected_opposite_loop_index",
+            "v30_selected_opposite_loop_axial",
+            "v30_candidate_would_expand_depth_rejected_count",
+            "v30_remote_fragment_rejected_count",
+            "v30_remote_fragment_rejected_faces",
+            "v30_depth_bounded_candidate_count",
+            "v30_depth_bounded_promoted_count",
+            "v30_depth_bounded_rejected_count",
+            "v30_depth_bounded_added_faces",
+            "v30_depth_bounded_final_face_count",
+            "v30_depth_bounded_final_component_count",
+            "v34_selected_opening_interior_wall_trace_used",
+            "v34_trace_seed_face_count",
+            "v34_trace_owned_face_count",
+            "v34_trace_added_face_count",
+            "v34_trace_component_count",
+            "v35_measured_interior_wall_continuation_used",
+            "v35_owned_seed_face_count",
+            "v35_continuation_candidate_component_count",
+            "v35_continuation_promoted_component_count",
+            "v35_continuation_added_faces",
+            "v35_continuation_final_face_count",
+            "v35_continuation_final_component_count",
+            "v36_cylindrical_unwrap_surface_completion_used",
+            "v36_unwrap_seed_face_count",
+            "v36_unwrap_eligible_face_count",
+            "v36_unwrap_seed_cell_count",
+            "v36_unwrap_accepted_cell_count",
+            "v36_unwrap_added_faces",
+            "v36_unwrap_final_face_count",
+            "v36_unwrap_final_component_count",
+            "v36_unwrap_theta_bin_count",
+            "v36_unwrap_axial_bin_count",
+            "v36_unwrap_angular_coverage_before",
+            "v36_unwrap_angular_coverage_after",
+            "v36_unwrap_completion_limited_by_continuity_budget",
+            "v37_selected_opening_angular_mouth_completion_used",
+            "v37_theta_authority",
+            "v37_mouth_seed_face_count",
+            "v37_mouth_seed_cell_count",
+            "v37_mouth_theta_bin_count",
+            "v37_mouth_theta_coverage",
+            "v37_effective_theta_bin_count",
+            "v37_mouth_axial_seed_bin_count",
+            "v37_start_cell_count",
+            "v37_eligible_face_count",
+            "v37_accepted_cell_count",
+            "v37_added_faces",
+            "v37_final_face_count",
+            "v37_final_component_count",
+            "v37_completion_limited_by_budget",
+            "v37_seed_axial_center",
+            "v37_mouth_axial_window",
+            "wall_band_face_count",
+            "strict_wall_mask_face_count",
+            "medium_wall_mask_face_count",
+            "owned_wall_face_count",
+            "owned_wall_seed_overlap",
+            "wall_component_count",
+            "transition_component_count",
+            "identity_support_face_count",
+            "unowned_context_face_count",
             "borehole_face_count",
             "chamfer_candidate_count",
             "unclassified_face_count",
@@ -961,6 +1595,30 @@ class BoreToolRuntime:
             return raw.strip().lower() not in {"0", "false", "no", "off", "direct"}
         return bool(raw)
 
+    def _use_planned_rebuild_for_bore_candidate(self) -> bool:
+        """Return whether candidate rebuild may use MeshProcessor's planned adapter.
+
+        The selected CandidateView is the rebuild authority.  The current safe
+        default is the direct core rebuild route, because older planned adapters
+        can reselect candidates by index/order and accidentally route a review
+        CHAMFER row such as ``review_chamfer_annular_transition_evidence`` into
+        the rebuild failure path.
+
+        Set FAR_MESH_BORE_REBUILD_PROCESS_TASKS=planned only after the
+        MeshProcessor planned adapter has been patched to match by candidate_id
+        and to treat candidate_index as diagnostics only.
+        """
+
+        raw = os.environ.get(PLANNED_BORE_REBUILD_OPT_IN_ENV, "")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower() in {"1", "true", "yes", "on", "planned", "phase6", "process_task"}
+        raw_owner = getattr(self.owner, "use_planned_bore_rebuild_for_candidate", None)
+        if raw_owner is None:
+            return False
+        if isinstance(raw_owner, str):
+            return raw_owner.strip().lower() in {"1", "true", "yes", "on", "planned", "phase6", "process_task"}
+        return bool(raw_owner)
+
     def _candidate_index_for(self, candidate: BoreCandidateView) -> int | None:
         if self.analysis_result is None:
             return None
@@ -1052,57 +1710,39 @@ class BoreToolRuntime:
             except Exception:
                 pass
 
-    def _clear_semantic_selection_after_rebuild(self) -> None:
-        """Clear stale edge/face selection after mesh replacement.
+    def _publish_region_select_normalized_edges(self, edge_ids: Iterable[int], *, raw_edge_ids: Iterable[int] = ()) -> None:
+        """Publish Region Select's normalized rim back to existing selection UI if possible.
 
-        A successful rebuild replaces the active mesh object and invalidates all
-        previous edge/face IDs.  Leaving old SelectionController or viewport pick
-        caches alive can make the next Ctrl+click return zero edges, or worse,
-        route stale IDs into Region Select.  This helper is workflow state reset,
-        not geometry/recognition logic.
+        This does not move selection authority into the GUI.  It only lets the
+        BoreTool facade show the Region Select result when the host exposes a
+        compatible setter.  If no setter exists, the normalized IDs are still
+        cached and used by BoreTool analysis/rebuild.
         """
 
-        controller = getattr(self.owner, "selection_controller", None)
-        clear_after_mesh_replacement = getattr(controller, "clear_after_mesh_replacement", None) if controller is not None else None
-        if callable(clear_after_mesh_replacement):
-            try:
-                clear_after_mesh_replacement(
-                    reason="boretool_rebuild_committed_clear_stale_selection",
-                    edge_region_strategy="bore_rim",
-                )
-                return
-            except Exception:
-                # Fall through to compatibility cleanup below.
-                pass
+        normalized = _tuple_ints_keep_order(edge_ids)
+        if not normalized:
+            return
+        raw = _tuple_ints_keep_order(raw_edge_ids)
+        if raw and tuple(normalized) == tuple(raw):
+            return
 
         controller = getattr(self.owner, "selection_controller", None)
         if controller is not None:
-            clear = getattr(controller, "clear_selection", None)
-            if callable(clear):
-                try:
-                    clear(keep_mode=True, reason="boretool_rebuild_committed_clear_stale_selection")
-                except TypeError:
-                    try:
-                        clear()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
             for name in (
-                "clear_edge_selection",
-                "clear_face_selection",
-                "clear_cached_selection",
-                "discard_cached_edge_ids",
-                "reset_cached_selection",
-                "invalidate_selection_cache",
+                "set_selected_edge_ids",
+                "set_edge_selection",
+                "replace_edge_selection",
+                "select_edge_ids",
             ):
                 fn = getattr(controller, name, None)
                 if callable(fn):
                     try:
-                        fn(reason="boretool_rebuild_committed_clear_stale_selection")
+                        fn(normalized, reason="boretool_region_select_normalized_opening_rim")
+                        return
                     except TypeError:
                         try:
-                            fn()
+                            fn(normalized)
+                            return
                         except Exception:
                             pass
                     except Exception:
@@ -1110,21 +1750,118 @@ class BoreToolRuntime:
 
         viewport = getattr(self.owner, "viewport", None)
         if viewport is not None:
+            for name in ("set_edge_selection", "set_selected_edge_ids", "highlight_edges"):
+                fn = getattr(viewport, name, None)
+                if callable(fn):
+                    try:
+                        fn(normalized)
+                        return
+                    except Exception:
+                        pass
+
+    def _clear_semantic_selection_after_rebuild(self) -> dict[str, object]:
+        """Clear stale edge/face selection after mesh replacement.
+
+        A successful rebuild replaces the active mesh object and invalidates all
+        previous edge/face IDs.  Leaving old SelectionController, viewport pick
+        caches, or Bore preview layers alive can make the next Ctrl+click return
+        zero edges, or worse, route stale IDs into Region Select.  This helper is
+        workflow state reset, not geometry/recognition logic.
+
+        v1.7.1: do not stop after the first compatible host cleanup method.  The
+        SelectionController, viewport, and Bore display layer may each hold their
+        own stale IDs/layers, so all compatible cleanup hooks are invoked.
+        """
+
+        reason = "boretool_rebuild_committed_clear_stale_selection"
+        diagnostics: dict[str, object] = {
+            "post_rebuild_cleanup_contract": POST_REBUILD_SELECTION_CLEANUP_CONTRACT,
+            "post_rebuild_cleanup_invoked": True,
+            "selection_controller_cleanup_calls": 0,
+            "viewport_cleanup_calls": 0,
+            "display_cleanup_calls": 0,
+        }
+
+        def _call(fn: object, *args: object, **kwargs: object) -> bool:
+            if not callable(fn):
+                return False
+            try:
+                fn(*args, **kwargs)
+                return True
+            except TypeError:
+                try:
+                    fn(*args)
+                    return True
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        controller = getattr(self.owner, "selection_controller", None)
+        if controller is not None:
+            clear_after_mesh_replacement = getattr(controller, "clear_after_mesh_replacement", None)
+            if _call(clear_after_mesh_replacement, reason=reason, edge_region_strategy="bore_rim"):
+                diagnostics["selection_controller_cleanup_calls"] = int(diagnostics["selection_controller_cleanup_calls"]) + 1
+
+            clear = getattr(controller, "clear_selection", None)
+            if _call(clear, keep_mode=True, reason=reason):
+                diagnostics["selection_controller_cleanup_calls"] = int(diagnostics["selection_controller_cleanup_calls"]) + 1
+
+            for name in (
+                "clear_edge_selection",
+                "clear_face_selection",
+                "clear_cached_selection",
+                "discard_cached_edge_ids",
+                "reset_cached_selection",
+                "invalidate_selection_cache",
+                "clear_pick_cache",
+                "clear_hover_selection",
+                "clear_tool_selection",
+                "clear_semantic_selection",
+            ):
+                if _call(getattr(controller, name, None), reason=reason):
+                    diagnostics["selection_controller_cleanup_calls"] = int(diagnostics["selection_controller_cleanup_calls"]) + 1
+
+        # Bore display callbacks may own candidate/selection preview layers that
+        # are independent from the viewport selection cache.  Clear these before
+        # the success callback paints the new rebuilt result.
+        for name in (
+            "_bore_display_clear_candidate_preview",
+            "_bore_display_clear_preview",
+            "_bore_display_clear_selection_preview",
+            "_bore_display_clear_boundary_preview",
+            "_bore_display_clear_highlights",
+        ):
+            if _call(getattr(self.owner, name, None), reason=reason):
+                diagnostics["display_cleanup_calls"] = int(diagnostics["display_cleanup_calls"]) + 1
+
+        viewport = getattr(self.owner, "viewport", None)
+        if viewport is not None:
             for name, args in (
                 ("set_edge_selection", ((),)),
                 ("set_selected_edge_ids", ((),)),
+                ("set_selected_edges", ((),)),
                 ("set_face_selection", ((),)),
+                ("set_selected_face_ids", ((),)),
+                ("set_selected_faces", ((),)),
+                ("highlight_edges", ((),)),
+                ("highlight_faces", ((),)),
                 ("highlight_cells", ((),)),
                 ("clear_selection", ()),
                 ("clear_edge_selection", ()),
                 ("clear_face_selection", ()),
+                ("clear_highlights", ()),
+                ("clear_edge_highlights", ()),
+                ("clear_face_highlights", ()),
+                ("clear_pick_cache", ()),
+                ("clear_selection_cache", ()),
+                ("invalidate_selection_cache", ()),
+                ("reset_selection_state", ()),
             ):
-                fn = getattr(viewport, name, None)
-                if callable(fn):
-                    try:
-                        fn(*args)
-                    except Exception:
-                        pass
+                if _call(getattr(viewport, name, None), *args):
+                    diagnostics["viewport_cleanup_calls"] = int(diagnostics["viewport_cleanup_calls"]) + 1
+
+        return diagnostics
 
     def _rearm_bore_edge_pick_after_rebuild(self) -> None:
         """Put the post-rebuild viewport back into Bore rim edge-pick mode."""
@@ -1379,6 +2116,7 @@ class BoreToolRuntime:
     def clear_after_rebuild(self) -> None:
         self.clear_display_state(clear_semantic_selection=False)
         self._clear_semantic_selection_after_rebuild()
+        self._rearm_bore_edge_pick_after_rebuild()
 
     # ------------------------------------------------------------------
     # BoreTool analysis / candidate display
@@ -1454,6 +2192,7 @@ class BoreToolRuntime:
         self.selected_candidate_id = result.selected_candidate_id
         self.previewed_candidate_id = ""
         self.cached_edge_ids = result.normalized_edge_ids or result.selected_edge_ids
+        self._publish_region_select_normalized_edges(self.cached_edge_ids, raw_edge_ids=result.selected_edge_ids)
         self._source_mesh_signature = self._mesh_signature()
         fn = getattr(self.owner, "_bore_display_analysis_result", None)
         if callable(fn):
@@ -1552,10 +2291,11 @@ class BoreToolRuntime:
 
         quad_density_mode = self._current_quad_density_mode()
         quad_density_label = self._quad_density_label(quad_density_mode)
+        feature_label = _feature_operation_name(candidate)
         if not self._confirm(
-            "Delete and rebuild previewed Bore candidate",
+            f"Delete and rebuild previewed {feature_label} candidate",
             (
-                "This dispatches the previewed BoreTool candidate to core.bore.rebuild.\n\n"
+                f"This dispatches the previewed {feature_label} CandidateData to core.bore.rebuild.\n\n"
                 f"Candidate: {candidate.label}\n"
                 f"Boundary edges: {len(edge_ids)}\n"
                 f"Display faces: {candidate.face_count}\n"
@@ -1573,11 +2313,18 @@ class BoreToolRuntime:
 
         def task() -> object:
             planned = getattr(processor, "rebuild_bore_candidate_planned", None)
-            if self._use_execution_layer_for_bore() and callable(planned):
+            if (
+                self._use_execution_layer_for_bore()
+                and self._use_planned_rebuild_for_bore_candidate()
+                and callable(planned)
+            ):
                 return planned(
                     edge_ids=edge_ids,
                     candidate=candidate,
-                    candidate_index=self._candidate_index_for(candidate),
+                    # Candidate index/order is diagnostic only.  Passing None
+                    # prevents old planned adapters from rebuilding a different
+                    # review-only row when recognition ordering changes.
+                    candidate_index=None,
                     quad_density_mode=quad_density_mode,
                     color_rebuilt_faces=True,
                 )
@@ -1598,8 +2345,9 @@ class BoreToolRuntime:
             )
 
         def on_failure(error: object) -> str:
-            message = str(error or "Bore rebuild failed.")
-            self._log(f"Bore rebuild failed: {message}")
+            feature_label = _feature_operation_name(candidate)
+            message = str(error or f"{feature_label} rebuild failed.")
+            self._log(f"{feature_label} rebuild failed: {message}")
             fn = getattr(self.owner, "_bore_display_error", None)
             if callable(fn):
                 fn(message)
@@ -1607,12 +2355,13 @@ class BoreToolRuntime:
 
         runner = getattr(self.owner, "_run_task", None)
         if callable(runner):
-            runner("Deleting and rebuilding previewed Bore candidate...", task, on_success, on_failure)
+            runner(f"Deleting and rebuilding previewed {_feature_operation_name(candidate)} candidate...", task, on_success, on_failure)
         else:
             try:
                 on_success(task())
             except Exception as exc:
-                self._critical("Bore rebuild failed", str(exc))
+                feature_label = _feature_operation_name(candidate)
+                self._critical(f"{feature_label} rebuild failed", str(exc))
                 on_failure(exc)
 
     def _handle_rebuild_success(
@@ -1652,8 +2401,9 @@ class BoreToolRuntime:
                 execution_layer == "process_task"
                 or task_kind == "bore_rebuild_candidate"
             )
+        feature_label = _feature_operation_name(candidate)
         if used_phase6_rebuild:
-            self._log("Bore rebuild candidate computed via Phase 6 task.")
+            self._log(f"{feature_label} rebuild candidate computed via Phase 6 task.")
 
         commit_result = None
         commit = getattr(processor, "commit_bore_rebuild_result", None)
@@ -1684,8 +2434,16 @@ class BoreToolRuntime:
 
         # Mesh replacement invalidates all edge/face IDs.  Clear stale semantic
         # selection immediately, then re-arm Bore rim edge picking on the new mesh.
-        self._clear_semantic_selection_after_rebuild()
+        cleanup_diag = self._clear_semantic_selection_after_rebuild()
         self._rearm_bore_edge_pick_after_rebuild()
+        if isinstance(cleanup_diag, Mapping):
+            self._log(
+                "BoreTool post-rebuild cleanup: "
+                f"{cleanup_diag.get('post_rebuild_cleanup_contract', POST_REBUILD_SELECTION_CLEANUP_CONTRACT)}; "
+                f"controller={cleanup_diag.get('selection_controller_cleanup_calls', 0)} "
+                f"viewport={cleanup_diag.get('viewport_cleanup_calls', 0)} "
+                f"display={cleanup_diag.get('display_cleanup_calls', 0)}."
+            )
 
         fn = getattr(self.owner, "_bore_display_rebuild_success", None)
         if callable(fn):
@@ -1717,8 +2475,9 @@ class BoreToolRuntime:
         self.cached_edge_ids = ()
         self._source_mesh_signature = None
         execution_note = " via Phase 6 task" if used_phase6_rebuild else ""
-        self._log(f"Bore rebuild committed{execution_note}: removed {removed_count}, added {added_count}, faces {before_faces} -> {after_faces}.")
-        self._status("Bore rebuild committed; stale selection cleared and Bore edge-pick re-armed.", 3000)
+        feature_label = _feature_operation_name(candidate)
+        self._log(f"{feature_label} rebuild committed{execution_note}: removed {removed_count}, added {added_count}, faces {before_faces} -> {after_faces}.")
+        self._status(f"{feature_label} rebuild committed; stale selection cleared and Bore edge-pick re-armed.", 3000)
         self._push_action_state()
 
     def _push_action_state(self) -> None:

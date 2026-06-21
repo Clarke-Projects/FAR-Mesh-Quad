@@ -16,7 +16,7 @@ from typing import Iterable, Mapping
 from .types import CandidateData, DeletePatchProposal, EdgeKey, FeatureFamily, RecognitionStage, tuple_edges, tuple_ints
 
 
-_REBUILD_ALLOWED_FAMILIES = {FeatureFamily.BORE.value, FeatureFamily.CHAMFER_FORM.value}
+_REBUILD_ALLOWED_FAMILIES = {FeatureFamily.BORE.value, FeatureFamily.CHAMFER_FORM.value, FeatureFamily.POCKET.value, FeatureFamily.CIRCULAR_POCKET.value}
 
 
 def _candidate_stage_and_family(candidate: CandidateData | Mapping[str, object]) -> tuple[str, str]:
@@ -39,6 +39,8 @@ def _candidate_stage_and_family(candidate: CandidateData | Mapping[str, object])
             family_value = FeatureFamily.BORE.value
         elif kind == "chamfer":
             family_value = FeatureFamily.CHAMFER_FORM.value
+        elif kind in {"pocket", "circular_pocket"}:
+            family_value = FeatureFamily.CIRCULAR_POCKET.value
         else:
             family_value = FeatureFamily.UNKNOWN.value
     return stage_value, family_value
@@ -68,7 +70,7 @@ def prepare_rebuild_target(
         raise ValueError(
             "CandidateData is not allowed to request a DeletePatchProposal. "
             f"recognition_stage={stage!r}; feature_family={family!r}. "
-            "Only accepted bore/chamfer-form candidates are currently rebuild-target eligible."
+            "Only accepted bore/chamfer/pocket CandidateData may request DeletePatchProposal; rebuild.py still validates topology."
         )
 
     if isinstance(candidate, CandidateData):
@@ -100,7 +102,7 @@ def prepare_rebuild_target(
             "candidate_data": base_diag,
             "recognition_stage_target_gate": _candidate_stage_and_family(candidate)[0],
             "feature_family_target_gate": _candidate_stage_and_family(candidate)[1],
-            "x1_family_target_policy": "only accepted_candidate bore/chamfer_form can build DeletePatchProposal",
+            "x1_family_target_policy": "accepted_candidate bore/chamfer_form/pocket/circular_pocket can build DeletePatchProposal; pocket uses owned pocket floor plus side-wall faces for recess-cup target in v99",
             **dict(diagnostics or {}),
         },
     )
@@ -239,24 +241,15 @@ def build_bounded_rebuild_target_face_sets(
             continue
         normalized_extras.append((extra_source_text, extra_ids))
 
-        # Damaged Bore repair target: when rebuild.py provides the local RegionData face
-        # pool, propose candidate-core + RegionData context as an internal delete-patch
-        # target without changing the recognition/preview face IDs.  This keeps
-        # recognition identity stable and moves target construction into this file.
+        # v33 semantic boundary: RegionData is neutral AOI/context evidence and
+        # cannot be unioned into CandidateData to create a delete patch.
         if extra_source_text == "region_data_face_pool":
-            union_ids = tuple(sorted(initial_set | set(extra_ids)))
-            if set(union_ids) != initial_set:
-                ok, reason = _is_candidate_owned_compatible("candidate_core_plus_region_data_context", union_ids)
-                if ok:
-                    face_sets.append(("candidate_core_plus_region_data_context", union_ids))
-                    candidate_plus_region_data_context_proposed = True
-                    candidate_plus_region_data_context_face_count = int(len(union_ids))
-                else:
-                    rejected_face_sets.append({
-                        "source": "candidate_core_plus_region_data_context",
-                        "face_count": int(len(union_ids)),
-                        "reason": reason,
-                    })
+            rejected_face_sets.append({
+                "source": "candidate_core_plus_region_data_context",
+                "face_count": int(len(initial_set | set(extra_ids))),
+                "reason": "disabled_by_v33_regiondata_is_not_candidate_ownership",
+            })
+            continue
 
         if set(extra_ids) == initial_set:
             continue
@@ -367,6 +360,8 @@ def build_bounded_rebuild_target_face_sets(
         "face_sets": tuple(deduped),
         "rejected_candidate_owned_face_sets": tuple(rejected_face_sets),
         "diagnostics": {
+            "v33_semantic_boundary_hardening_used": True,
+            "region_data_union_enabled": False,
             "source": "rebuild_target.build_bounded_rebuild_target_face_sets",
             "initial_face_count": int(len(initial)),
             "candidate_owned": bool(preview_candidate_patch_owns_delete),

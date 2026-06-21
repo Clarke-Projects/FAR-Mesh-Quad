@@ -3507,7 +3507,11 @@ class MeshProcessor:
             "vertex_count": vertex_count,
         }
         if candidate_index is not None:
-            payload["candidate_index"] = int(candidate_index)
+            # Diagnostic only: BORE_REBUILD_CANDIDATE must consume the explicit
+            # CandidateView/CandidateData payload above. Candidate index is not
+            # rebuild authority and must not be used by task handlers to
+            # reselect or reinterpret CandidateData.
+            payload["source_candidate_index_hint"] = int(candidate_index)
         if rebuilt_face_color is not None:
             payload["rebuilt_face_color"] = tuple(int(v) for v in rebuilt_face_color)
 

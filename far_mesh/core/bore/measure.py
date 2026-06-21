@@ -42,6 +42,7 @@ from .geometry import (
     unit_vector,
 )
 from .topology import connected_edge_components, edge_graph_stats, face_edges, normalize_edge
+from .types import tuple_ints
 
 EdgeKey = tuple[int, int]
 
@@ -102,6 +103,51 @@ class BoreRegionMeasurement:
     diagnostics: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class BoreTwoOpeningMeasurement:
+    """Measured BORE frame from selected opening A and opposite opening B.
+
+    This is measurement evidence only.  It does not own wall faces, does not
+    create CandidateData, and does not authorize rebuild.  Its purpose is to
+    make the intended BORE order explicit:
+
+        selected opening -> opposite opening -> refined bore frame -> wall search
+    """
+
+    selected_opening: BoreOpeningMeasurement
+    opposite_opening: BoreOpeningMeasurement | None
+    valid: bool
+    center: Vector3
+    axis: Vector3
+    radius: float
+    diameter: float
+    depth: float
+    opening_center: Vector3
+    opposite_center: Vector3
+    axial_min: float
+    axial_max: float
+    confidence: float
+    diagnostics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "valid": bool(self.valid),
+            "center": self.center,
+            "axis": self.axis,
+            "radius": float(self.radius),
+            "diameter": float(self.diameter),
+            "depth": float(self.depth),
+            "opening_center": self.opening_center,
+            "opposite_center": self.opposite_center,
+            "axial_min": float(self.axial_min),
+            "axial_max": float(self.axial_max),
+            "confidence": float(self.confidence),
+            "selected_opening": _opening_measurement_to_dict(self.selected_opening),
+            "opposite_opening": _opening_measurement_to_dict(self.opposite_opening) if self.opposite_opening is not None else {},
+            "diagnostics": dict(self.diagnostics or {}),
+        }
+
+
 # -----------------------------------------------------------------------------
 # Public measurement API
 # -----------------------------------------------------------------------------
@@ -152,8 +198,10 @@ def measure_bore_opening(
     # the largest connected component).  Measure the whole selected edge cloud
     # instead of failing before the geometric fit can happen.
     largest_fraction = float(len(main_component)) / max(float(len(all_selected_edges)), 1.0)
+    polluted_fragment_cloud = bool(len(components) > 12 and largest_fraction < 0.25)
     use_all_fragments = bool(
-        len(all_selected_vertices) >= int(min_ring_points)
+        not polluted_fragment_cloud
+        and len(all_selected_vertices) >= int(min_ring_points)
         and (
             len(main_vertices) < int(min_ring_points)
             or (len(components) > 1 and largest_fraction < 0.45)
@@ -167,7 +215,7 @@ def measure_bore_opening(
     else:
         measurement_edges = main_component
         selected_vertices = main_vertices
-        component_strategy = "largest_connected_component"
+        component_strategy = "largest_connected_component" if not polluted_fragment_cloud else "largest_component_only_polluted_fragment_cloud_rejected"
 
     if len(selected_vertices) < int(min_ring_points):
         raise ValueError(
@@ -327,11 +375,16 @@ def measure_bore_opening_candidates(
         return tuple(c for c in (primary,) if c is not None)
 
     all_vertices = tuple(sorted({v for edge in all_edges for v in edge}))
+    components_for_cloud_guard = connected_edge_components(set(all_edges))
+    largest_cloud_fraction = (
+        float(max((len(comp) for comp in components_for_cloud_guard), default=0)) / max(float(len(all_edges)), 1.0)
+    )
+    polluted_fragment_cloud = bool(len(components_for_cloud_guard) > 12 and largest_cloud_fraction < 0.25)
     candidates: list[BoreOpeningMeasurement] = []
     if primary is not None:
         candidates.append(primary)
 
-    if len(all_vertices) >= int(min_ring_points):
+    if (not polluted_fragment_cloud) and len(all_vertices) >= int(min_ring_points):
         points = vertices[np.asarray(all_vertices, dtype=np.int64), :3]
         initial_ring = fit_ring_points(points, min_points=int(min_ring_points), min_radius=float(min_radius))
         if initial_ring is not None:
@@ -388,6 +441,761 @@ def measure_bore_opening_candidates(
     deduped.sort(key=_opening_candidate_preference_score, reverse=True)
     return tuple(deduped[: max(1, int(max_candidates))])
 
+
+
+def measure_bore_opening_component_candidates(
+    mesh: trimesh.Trimesh,
+    edge_ids: Iterable[int],
+    *,
+    min_ring_points: int = 6,
+    min_radius: float = 0.05,
+    max_candidates: int = 12,
+) -> tuple[BoreOpeningMeasurement, ...]:
+    """Resolve measured opening candidates from raw selected-edge components.
+
+    This is the damaged-bore measurement repair path.  ``measure_bore_opening``
+    and ``measure_bore_opening_candidates`` can fit a whole selected edge cloud
+    when the selection is fragmented.  That is useful when all fragments belong
+    to one physical rim, but it is wrong when a damaged imported mesh produces a
+    polluted selection containing hundreds of unrelated edge fragments.
+
+    This helper performs the missing semantic measurement transform:
+
+        raw selected edge evidence -> component-seeded MeasuredBoreFrame candidates
+
+    It does not classify a BORE, does not own wall faces, and does not authorize
+    rebuild.  It simply measures local ring candidates that are seeded by actual
+    connected components of the raw selection, then expands each seed only to
+    nearby selected fragments that agree with the seed's plane/radius frame.
+    """
+
+    _validate_mesh(mesh)
+    selected_edge_ids = tuple(sorted({int(v) for v in edge_ids if int(v) >= 0}))
+    if not selected_edge_ids:
+        return ()
+
+    vertices = _mesh_vertices(mesh)
+    edge_table = build_edge_table(mesh)
+    unique_edges = edge_table.get("unique_edges")
+    if not isinstance(unique_edges, tuple):
+        return ()
+
+    try:
+        all_edges = {normalize_edge(edge) for edge in _edge_ids_to_keys(selected_edge_ids, unique_edges)}
+    except Exception:
+        return ()
+    if len(all_edges) < int(min_ring_points):
+        return ()
+
+    components = connected_edge_components(set(all_edges))
+    if not components:
+        return ()
+
+    def _edge_length(edge: EdgeKey) -> float:
+        a, b = edge
+        if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+            return 0.0
+        return float(np.linalg.norm(vertices[a, :3] - vertices[b, :3]))
+
+    selected_lengths = [_edge_length(edge) for edge in all_edges]
+    selected_lengths = [v for v in selected_lengths if np.isfinite(v) and v > 1.0e-12]
+    median_edge_length = float(np.median(np.asarray(selected_lengths, dtype=float))) if selected_lengths else 1.0
+
+    candidates: list[BoreOpeningMeasurement] = []
+    # Prefer meaningful components, but keep enough small components for damaged
+    # fragmented rims where the correct mouth may be represented only by arcs.
+    ranked_components = sorted(
+        (set(comp) for comp in components if comp),
+        key=lambda comp: (-len(comp), tuple(sorted(comp))[:1]),
+    )
+    max_seed_components = min(80, len(ranked_components))
+
+    for component_index, comp in enumerate(ranked_components[:max_seed_components]):
+        comp_edges = {normalize_edge(edge) for edge in comp}
+        comp_vertices = tuple(sorted({v for edge in comp_edges for v in edge}))
+        if len(comp_edges) < max(3, int(min_ring_points) // 2) or len(comp_vertices) < int(min_ring_points):
+            continue
+
+        seed_points = vertices[np.asarray(comp_vertices, dtype=np.int64), :3]
+        seed_ring = fit_ring_points(seed_points, min_points=int(min_ring_points), min_radius=float(min_radius))
+        if seed_ring is None:
+            continue
+        if float(seed_ring.radius) <= max(float(min_radius), 1.0e-12):
+            continue
+
+        seed_center = np.asarray(seed_ring.center, dtype=float).reshape(3)
+        seed_axis = unit_vector(seed_ring.axis)
+        seed_radius = float(seed_ring.radius)
+        # A component is only a seed.  Expand to selected fragments that live in
+        # the same local opening plane and radius band.  This allows broken rim
+        # fragments to join the measurement without letting the whole polluted
+        # selection cloud become one ring.
+        plane_tol = max(
+            float(seed_ring.plane_rms) * 3.0,
+            float(seed_ring.plane_mad) * 4.0,
+            seed_radius * 0.14,
+            median_edge_length * 3.0,
+            1.0e-6,
+        )
+        radial_tol = max(
+            float(seed_ring.radius_mad) * 4.5,
+            float(seed_ring.radius_rms) * 2.75,
+            seed_radius * 0.085,
+            median_edge_length * 2.25,
+            1.0e-6,
+        )
+        # v1.3.7 seed-island repair:
+        # The previous raw-component resolver expanded a seed component against
+        # *all* selected edges that matched the same plane/radius band. On large
+        # damaged imports that can accidentally pull in a different selected
+        # region that happens to share the same cylindrical frame. Measurement
+        # must construct the selected opening, so expansion is now additionally
+        # bounded to the spatial neighborhood of the seed ring. A true rim edge
+        # lies roughly one radius from the ring center; remote geometry should
+        # not be allowed to join merely because it is co-planar and radius-like.
+        local_distance_limit = max(
+            1.85 * max(seed_radius, 1.0e-9),
+            9.0 * max(median_edge_length, 1.0e-9),
+            2.5 * max(plane_tol, radial_tol, 1.0e-9),
+        )
+        local_distance_rejected = 0
+        inlier_edges: set[EdgeKey] = set()
+        for edge in all_edges:
+            a, b = edge
+            if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+                continue
+            pa = vertices[a, :3]
+            pb = vertices[b, :3]
+            mid = 0.5 * (pa + pb)
+            rel = mid - seed_center
+            if float(np.linalg.norm(rel)) > float(local_distance_limit):
+                local_distance_rejected += 1
+                continue
+            axial = float(np.dot(rel, seed_axis))
+            radial_vec = rel - seed_axis * axial
+            radial = float(np.linalg.norm(radial_vec))
+            if not np.isfinite(radial):
+                continue
+            vec = pb - pa
+            length = float(np.linalg.norm(vec))
+            if not np.isfinite(length) or length <= 1.0e-12:
+                continue
+            tangent = vec / length
+            radial_unit = radial_vec / max(radial, 1.0e-12)
+            # Drop obvious spokes/cross edges where possible.
+            radial_tangent = abs(float(np.dot(tangent, radial_unit))) if radial > 1.0e-12 else 0.0
+            axial_tangent = abs(float(np.dot(tangent, seed_axis)))
+            if radial_tangent > 0.92 and axial_tangent < 0.35:
+                continue
+            if abs(axial) <= plane_tol and abs(radial - seed_radius) <= radial_tol:
+                inlier_edges.add(edge)
+
+        if len(inlier_edges) < int(min_ring_points):
+            continue
+        inlier_vertices = tuple(sorted({v for edge in inlier_edges for v in edge}))
+        if len(inlier_vertices) < int(min_ring_points):
+            continue
+
+        points = vertices[np.asarray(inlier_vertices, dtype=np.int64), :3]
+        ring = fit_ring_points(points, axis=seed_axis, min_points=int(min_ring_points), min_radius=float(min_radius))
+        if ring is None:
+            continue
+
+        # One bounded cleanup pass in the refit frame.
+        center2 = np.asarray(ring.center, dtype=float).reshape(3)
+        axis2 = unit_vector(ring.axis)
+        radius2 = float(ring.radius)
+        radial_tol2 = max(
+            float(ring.radius_mad) * 4.0,
+            float(ring.radius_rms) * 2.25,
+            radius2 * 0.070,
+            median_edge_length * 2.0,
+            1.0e-6,
+        )
+        plane_tol2 = max(
+            float(ring.plane_mad) * 4.0,
+            float(ring.plane_rms) * 2.25,
+            radius2 * 0.10,
+            median_edge_length * 2.5,
+            1.0e-6,
+        )
+        local_distance_limit2 = max(
+            1.85 * max(radius2, 1.0e-9),
+            9.0 * max(median_edge_length, 1.0e-9),
+            2.5 * max(plane_tol2, radial_tol2, 1.0e-9),
+        )
+        refined_edges: set[EdgeKey] = set()
+        for edge in inlier_edges:
+            a, b = edge
+            mid = 0.5 * (vertices[a, :3] + vertices[b, :3])
+            rel = mid - center2
+            if float(np.linalg.norm(rel)) > float(local_distance_limit2):
+                continue
+            axial = float(np.dot(rel, axis2))
+            radial_vec = rel - axis2 * axial
+            radial = float(np.linalg.norm(radial_vec))
+            if abs(axial) <= plane_tol2 and abs(radial - radius2) <= radial_tol2:
+                refined_edges.add(edge)
+        if len(refined_edges) >= int(min_ring_points):
+            refined_vertices = tuple(sorted({v for edge in refined_edges for v in edge}))
+            if len(refined_vertices) >= int(min_ring_points):
+                points2 = vertices[np.asarray(refined_vertices, dtype=np.int64), :3]
+                ring2 = fit_ring_points(points2, axis=axis2, min_points=int(min_ring_points), min_radius=float(min_radius))
+                if ring2 is not None:
+                    inlier_edges = refined_edges
+                    inlier_vertices = refined_vertices
+                    ring = ring2
+
+        support_fraction = float(len(inlier_edges)) / max(float(len(all_edges)), 1.0)
+        seed_fraction = float(len(comp_edges)) / max(float(len(all_edges)), 1.0)
+        try:
+            measurement = _opening_measurement_from_ring_edges(
+                vertices=vertices,
+                unique_edges=unique_edges,
+                input_edge_count=len(selected_edge_ids),
+                measurement_edges=inlier_edges,
+                selected_vertices=inlier_vertices,
+                ring=ring,
+                component_strategy="raw_selected_edge_component_opening_resolver",
+                extra_diagnostics={
+                    "mode": "raw_selected_edge_component_opening_resolver",
+                    "component_index": int(component_index),
+                    "component_count": int(len(components)),
+                    "seed_component_edge_count": int(len(comp_edges)),
+                    "seed_component_vertex_count": int(len(comp_vertices)),
+                    "seed_component_fraction": float(seed_fraction),
+                    # v1.3.7: preserve the primary raw selected-edge component
+                    # separately from the expanded inlier ring. Downstream
+                    # Recognition must use this seed island as locality authority;
+                    # expanded fragments are measurement support only and may not
+                    # become display/rebuild seed authority.
+                    "seed_component_edge_ids": tuple(sorted(_keys_to_ids(comp_edges, unique_edges))),
+                    "expanded_inlier_edge_ids": tuple(sorted(_keys_to_ids(inlier_edges, unique_edges))),
+                    "expanded_inlier_edge_count": int(len(inlier_edges)),
+                    "expanded_inlier_vertex_count": int(len(inlier_vertices)),
+                    "expanded_support_fraction": float(support_fraction),
+                    "seed_radius": float(seed_radius),
+                    "resolved_radius": float(ring.radius),
+                    "plane_tolerance": float(plane_tol),
+                    "radial_tolerance": float(radial_tol),
+                    "local_distance_limit": float(local_distance_limit),
+                    "local_distance_rejected_edge_count": int(local_distance_rejected),
+                    "median_selected_edge_length": float(median_edge_length),
+                    "all_raw_component_count": int(len(components)),
+                },
+            )
+        except Exception:
+            continue
+        candidates.append(measurement)
+
+    # Dedupe near-identical component-resolved frames.
+    deduped: list[BoreOpeningMeasurement] = []
+    for cand in candidates:
+        duplicate_index = None
+        cand_center = np.asarray(cand.center, dtype=float)
+        cand_axis = unit_vector(cand.axis)
+        for idx, old in enumerate(deduped):
+            old_center = np.asarray(old.center, dtype=float)
+            old_axis = unit_vector(old.axis)
+            if abs(float(np.dot(cand_axis, old_axis))) < 0.985:
+                continue
+            radius_ref = max(float(cand.radius), float(old.radius), 1.0e-9)
+            radius_close = abs(float(cand.radius) - float(old.radius)) <= max(radius_ref * 0.04, 0.10)
+            delta = cand_center - old_center
+            center_cross = float(np.linalg.norm(delta - cand_axis * float(np.dot(delta, cand_axis))))
+            if radius_close and center_cross <= max(radius_ref * 0.06, 0.45):
+                duplicate_index = idx
+                break
+        if duplicate_index is None:
+            deduped.append(cand)
+        else:
+            if _opening_candidate_preference_score(cand) > _opening_candidate_preference_score(deduped[duplicate_index]):
+                deduped[duplicate_index] = cand
+
+    def _component_resolver_score(cand: BoreOpeningMeasurement) -> float:
+        diag = dict(cand.diagnostics or {})
+        support = float(diag.get("expanded_support_fraction", 0.0) or 0.0)
+        seed_edges = float(diag.get("seed_component_edge_count", 0.0) or 0.0)
+        return float(
+            1.10 * float(cand.confidence)
+            + 0.90 * float(cand.circularity)
+            + 0.55 * min(float(cand.edge_count) / 80.0, 1.0)
+            + 0.35 * min(seed_edges / 32.0, 1.0)
+            + 0.45 * min(support * 8.0, 1.0)
+            - 0.90 * min(float(cand.radius_rel_rms), 1.0)
+            - 0.25 * min(float(cand.plane_rel_rms), 1.0)
+        )
+
+    deduped.sort(key=_component_resolver_score, reverse=True)
+    return tuple(deduped[: max(1, int(max_candidates))])
+
+
+def _opening_measurement_to_dict(opening: BoreOpeningMeasurement | None) -> dict[str, object]:
+    if opening is None:
+        return {}
+    return {
+        "edge_ids": tuple(int(v) for v in opening.edge_ids),
+        "edge_count": int(opening.edge_count),
+        "vertex_count": int(opening.vertex_count),
+        "center": opening.center,
+        "axis": opening.axis,
+        "radius": float(opening.radius),
+        "diameter": float(opening.diameter),
+        "closed": bool(opening.closed),
+        "near_closed": bool(opening.near_closed),
+        "endpoint_gap_ratio": float(opening.endpoint_gap_ratio),
+        "component_count": int(opening.component_count),
+        "plane_rel_rms": float(opening.plane_rel_rms),
+        "radius_rel_rms": float(opening.radius_rel_rms),
+        "circularity": float(opening.circularity),
+        "confidence": float(opening.confidence),
+        "diagnostics": dict(opening.diagnostics or {}),
+    }
+
+
+def _median_runtime_edge_length(vertices: np.ndarray, edges: Iterable[EdgeKey]) -> float:
+    vals: list[float] = []
+    for edge in tuple(edges or ()):
+        try:
+            a, b = normalize_edge(edge)
+        except Exception:
+            continue
+        if 0 <= a < len(vertices) and 0 <= b < len(vertices):
+            length = float(np.linalg.norm(vertices[a, :3] - vertices[b, :3]))
+            if np.isfinite(length) and length > 1.0e-12:
+                vals.append(length)
+    if not vals:
+        return 1.0
+    return float(np.median(np.asarray(vals, dtype=float)))
+
+
+def _ring_opening_from_boundary_loop(
+    *,
+    vertices: np.ndarray,
+    unique_edges: tuple[EdgeKey, ...],
+    loop_edges: Iterable[EdgeKey],
+    axis_hint_value: object,
+    min_ring_points: int,
+    min_radius: float,
+) -> BoreOpeningMeasurement | None:
+    """Measure one boundary-loop candidate as an opening ring."""
+
+    edges = {normalize_edge(edge) for edge in tuple(loop_edges or ())}
+    if len(edges) < int(min_ring_points):
+        return None
+    vertex_ids = tuple(sorted({v for edge in edges for v in edge if 0 <= int(v) < len(vertices)}))
+    if len(vertex_ids) < int(min_ring_points):
+        return None
+    pts = vertices[np.asarray(vertex_ids, dtype=np.int64), :3]
+    ring = fit_ring_points(pts, axis=axis_hint_value, min_points=int(min_ring_points), min_radius=float(min_radius))
+    if ring is None:
+        return None
+    try:
+        return _opening_measurement_from_ring_edges(
+            vertices=vertices,
+            unique_edges=unique_edges,
+            input_edge_count=len(edges),
+            measurement_edges=edges,
+            selected_vertices=vertex_ids,
+            ring=ring,
+            component_strategy="opposite_boundary_loop_candidate",
+            extra_diagnostics={
+                "mode": "opposite_boundary_loop_candidate",
+                "boundary_loop_edge_count": int(len(edges)),
+                "semantic_role": "opposite_opening_evidence_candidate",
+            },
+        )
+    except Exception:
+        graph = edge_graph_stats(edges, vertices=vertices)
+        return BoreOpeningMeasurement(
+            edge_ids=tuple(sorted(_keys_to_ids(edges, unique_edges))),
+            edge_count=int(len(edges)),
+            vertex_ids=vertex_ids,
+            vertex_count=int(len(vertex_ids)),
+            center=ring.center,
+            axis=ring.axis,
+            radius=float(ring.radius),
+            diameter=float(ring.diameter),
+            closed=bool(graph.get("closed", False)),
+            near_closed=bool(graph.get("closed", False)),
+            endpoint_gap=float(graph.get("endpoint_gap", 0.0)),
+            endpoint_gap_ratio=float(graph.get("endpoint_gap", 0.0)) / max(float(graph.get("median_edge_length", 1.0)), 1.0e-12),
+            branch_vertex_count=int(graph.get("branch_vertex_count", 0) or 0),
+            open_endpoint_count=int(graph.get("open_endpoint_count", 0) or 0),
+            component_count=int(graph.get("component_count", 1) or 1),
+            plane_rms=float(ring.plane_rms),
+            plane_rel_rms=float(ring.plane_rel_rms),
+            radius_rms=float(ring.radius_rms),
+            radius_rel_rms=float(ring.radius_rel_rms),
+            radius_mad=float(ring.radius_mad),
+            circularity=float(ring.circularity),
+            confidence=float(ring.confidence),
+            diagnostics={"mode": "opposite_boundary_loop_candidate", "fallback_constructor": True},
+        )
+
+
+
+def _opposite_opening_candidates_from_region_edge_bands(
+    *,
+    mesh: trimesh.Trimesh,
+    vertices: np.ndarray,
+    unique_edges: tuple[EdgeKey, ...],
+    region_face_ids: Iterable[int],
+    selected_opening: BoreOpeningMeasurement,
+    selected_edges: set[EdgeKey],
+    selected_axis: np.ndarray,
+    selected_center: np.ndarray,
+    selected_radius: float,
+    median_edge_length: float,
+    min_ring_points: int,
+    min_radius: float,
+    max_candidates: int = 12,
+) -> tuple[tuple[str, int, BoreOpeningMeasurement, set[EdgeKey]], ...]:
+    """Find opposite-opening evidence from feature/rim-like edge bands.
+
+    RegionData boundary loops are neutral AOI boundaries.  On clean bore meshes
+    the true opposite rim may be a feature/seam loop inside that AOI rather than
+    a boundary loop of the RegionData patch.  This helper searches RegionData
+    edges near the selected opening cylinder, clusters them by axial station,
+    and measures each cluster as a possible opposite opening.  The result is
+    still measurement evidence only; Recognition must own wall faces later.
+    """
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)[:, :3]
+    valid_region_faces = {int(fid) for fid in tuple(region_face_ids or ()) if 0 <= int(fid) < len(faces)}
+    if not valid_region_faces or not unique_edges:
+        return ()
+
+    region_edges: set[EdgeKey] = set()
+    for fid in valid_region_faces:
+        try:
+            for edge in face_edges(faces[int(fid)]):
+                region_edges.add(normalize_edge(edge))
+        except Exception:
+            continue
+
+    # Do not re-measure the selected mouth as the opposite opening.
+    region_edges.difference_update(selected_edges)
+    if len(region_edges) < int(min_ring_points):
+        return ()
+
+    radius = float(max(selected_radius, min_radius, 1.0e-9))
+    axial_skip = max(0.45 * radius, 4.0 * max(float(median_edge_length), 1.0e-9), 0.75)
+    radial_tol = max(0.22 * radius, 4.0 * max(float(median_edge_length), 1.0e-9), 0.35)
+    bin_width = max(0.075 * radius, 3.0 * max(float(median_edge_length), 1.0e-9), 0.45)
+
+    band_edges_by_bin: dict[int, set[EdgeKey]] = {}
+    for edge in region_edges:
+        a, b = normalize_edge(edge)
+        if not (0 <= a < len(vertices) and 0 <= b < len(vertices)):
+            continue
+        mid = 0.5 * (vertices[a, :3] + vertices[b, :3])
+        rel = mid - selected_center.reshape(3)
+        axial = float(np.dot(rel, selected_axis))
+        if not np.isfinite(axial) or abs(axial) < axial_skip:
+            continue
+        radial_vec = rel - selected_axis * axial
+        radial = float(np.linalg.norm(radial_vec))
+        if not np.isfinite(radial):
+            continue
+        if abs(radial - radius) > radial_tol:
+            continue
+        bin_id = int(round(axial / bin_width))
+        band_edges_by_bin.setdefault(bin_id, set()).add(edge)
+
+    measured: list[tuple[str, int, BoreOpeningMeasurement, set[EdgeKey]]] = []
+    for bin_id, edges in sorted(band_edges_by_bin.items(), key=lambda item: -len(item[1])):
+        # Include immediate neighboring bins so tessellated rims split across a
+        # few axial slices are measured as one physical opening station.
+        cluster_edges: set[EdgeKey] = set(edges)
+        cluster_edges.update(band_edges_by_bin.get(bin_id - 1, set()))
+        cluster_edges.update(band_edges_by_bin.get(bin_id + 1, set()))
+        if len(cluster_edges) < int(min_ring_points):
+            continue
+        candidate = _ring_opening_from_boundary_loop(
+            vertices=vertices,
+            unique_edges=unique_edges,
+            loop_edges=cluster_edges,
+            axis_hint_value=selected_axis,
+            min_ring_points=int(min_ring_points),
+            min_radius=float(min_radius),
+        )
+        if candidate is None:
+            continue
+        measured.append(("region_edge_band", int(bin_id), candidate, cluster_edges))
+        if len(measured) >= int(max_candidates):
+            break
+    return tuple(measured)
+
+
+def measure_two_opening_bore_frame(
+    mesh: trimesh.Trimesh,
+    selected_opening: BoreOpeningMeasurement,
+    *,
+    region_boundary_loops: Iterable[Iterable[EdgeKey]] = (),
+    region_face_ids: Iterable[int] = (),
+    min_ring_points: int = 6,
+    min_radius: float = 0.05,
+) -> BoreTwoOpeningMeasurement:
+    """Measure a BORE frame by explicitly finding the opposite opening.
+
+    This implements the intended BORE measurement order:
+
+        selected opening A -> opposite opening B -> refined A/B bore frame.
+
+    It never treats RegionData axial extent as an opposite opening.  RegionData
+    may provide boundary-loop evidence where the opposite opening can be found;
+    if no loop is measured, the result is invalid/review-only evidence.
+    """
+
+    _validate_mesh(mesh)
+    vertices = _mesh_vertices(mesh)
+    edge_table = build_edge_table(mesh)
+    unique_edges = edge_table.get("unique_edges")
+    if not isinstance(unique_edges, tuple):
+        unique_edges = ()
+
+    selected_axis = unit_vector(selected_opening.axis)
+    selected_center = np.asarray(selected_opening.center, dtype=float).reshape(3)
+    selected_radius = float(selected_opening.radius)
+    selected_edges = {normalize_edge(edge) for edge in _edge_ids_to_keys(tuple_ints(selected_opening.edge_ids), unique_edges)} if unique_edges and selected_opening.edge_ids else set()
+    median_edge_length = _median_runtime_edge_length(vertices, selected_edges) if selected_edges else 1.0
+
+    candidates: list[tuple[float, BoreOpeningMeasurement, dict[str, object]]] = []
+    all_candidate_diagnostics: list[dict[str, object]] = []
+    seen_loop_count = 0
+
+    def _consider_opposite_candidate(
+        *,
+        source: str,
+        source_index: int,
+        candidate: BoreOpeningMeasurement,
+        source_edges: set[EdgeKey],
+    ) -> None:
+        cand_center = np.asarray(candidate.center, dtype=float).reshape(3)
+        cand_axis = unit_vector(candidate.axis)
+        delta = cand_center - selected_center
+        axial_sep = float(np.dot(delta, selected_axis))
+        abs_axial_sep = abs(axial_sep)
+        cross = float(np.linalg.norm(delta - selected_axis * axial_sep))
+        radius_ref = max(float(selected_radius), float(candidate.radius), 1.0e-9)
+        radius_delta_rel = abs(float(candidate.radius) - float(selected_radius)) / radius_ref
+        axis_dot = abs(float(np.dot(selected_axis, cand_axis)))
+        overlap_edges = int(len(selected_edges & source_edges)) if selected_edges else 0
+        overlap_ratio = float(overlap_edges) / max(float(min(len(selected_edges), len(source_edges))), 1.0) if selected_edges else 0.0
+        min_depth = max(0.75 * radius_ref, 5.0 * max(median_edge_length, 1.0e-9), 0.50)
+        centerline_limit = max(0.35 * radius_ref, 4.0 * max(median_edge_length, 1.0e-9), 0.75)
+
+        rejection_reasons: list[str] = []
+        if overlap_ratio > 0.25:
+            rejection_reasons.append("overlaps_selected_opening")
+        if abs_axial_sep < min_depth:
+            rejection_reasons.append("axial_separation_below_min_depth")
+        if axis_dot < 0.70:
+            rejection_reasons.append("axis_not_parallel_to_selected_opening")
+        if radius_delta_rel > 0.45:
+            rejection_reasons.append("radius_mismatch_to_selected_opening")
+        if cross > centerline_limit:
+            rejection_reasons.append("centerline_distance_too_large")
+        valid = not rejection_reasons
+
+        depth_score = clamp(abs_axial_sep / max(1.75 * radius_ref, 1.0e-9), 0.0, 1.0)
+        radius_score = 1.0 - clamp(radius_delta_rel / 0.45, 0.0, 1.0)
+        center_score = 1.0 - clamp(cross / max(centerline_limit, 1.0e-9), 0.0, 1.0)
+        score = (
+            1.50 * float(candidate.confidence)
+            + 1.20 * float(candidate.circularity)
+            + 1.25 * float(axis_dot)
+            + 1.50 * radius_score
+            + 1.50 * center_score
+            + 1.10 * depth_score
+            + 0.40 * min(float(candidate.edge_count) / 96.0, 1.0)
+            - 2.50 * overlap_ratio
+        )
+        diag = {
+            "source": str(source),
+            "source_index": int(source_index),
+            "valid_opposite_candidate": bool(valid),
+            "rejection_reasons": tuple(rejection_reasons),
+            "score": float(score),
+            "axial_separation": float(axial_sep),
+            "abs_axial_separation": float(abs_axial_sep),
+            "min_depth": float(min_depth),
+            "centerline_distance": float(cross),
+            "centerline_limit": float(centerline_limit),
+            "axis_abs_dot": float(axis_dot),
+            "radius_delta_rel": float(radius_delta_rel),
+            "selected_edge_overlap_count": int(overlap_edges),
+            "selected_edge_overlap_ratio": float(overlap_ratio),
+            "candidate_edge_count": int(candidate.edge_count),
+            "candidate_radius": float(candidate.radius),
+            "candidate_confidence": float(candidate.confidence),
+            "candidate_center": candidate.center,
+            "candidate_axis": candidate.axis,
+        }
+        all_candidate_diagnostics.append(diag)
+        if valid:
+            candidates.append((float(score), candidate, diag))
+
+    for loop_index, raw_loop in enumerate(tuple(region_boundary_loops or ()), start=1):
+        loop_edges = {normalize_edge(edge) for edge in tuple(raw_loop or ())}
+        if len(loop_edges) < int(min_ring_points):
+            continue
+        seen_loop_count += 1
+        candidate = _ring_opening_from_boundary_loop(
+            vertices=vertices,
+            unique_edges=unique_edges,
+            loop_edges=loop_edges,
+            axis_hint_value=selected_axis,
+            min_ring_points=int(min_ring_points),
+            min_radius=float(min_radius),
+        )
+        if candidate is None:
+            all_candidate_diagnostics.append({
+                "source": "region_boundary_loop",
+                "source_index": int(loop_index),
+                "valid_opposite_candidate": False,
+                "rejection_reasons": ("loop_could_not_be_fit_as_opening",),
+                "candidate_edge_count": int(len(loop_edges)),
+            })
+            continue
+        _consider_opposite_candidate(
+            source="region_boundary_loop",
+            source_index=int(loop_index),
+            candidate=candidate,
+            source_edges=loop_edges,
+        )
+
+    # v1.5.3: RegionData boundary loops are AOI boundaries, not guaranteed
+    # physical bore rims.  If no opposite was accepted from the AOI boundary,
+    # search internal feature/seam edge bands near the selected opening cylinder.
+    edge_band_candidate_count = 0
+    if not candidates:
+        for source, source_index, candidate, source_edges in _opposite_opening_candidates_from_region_edge_bands(
+            mesh=mesh,
+            vertices=vertices,
+            unique_edges=unique_edges,
+            region_face_ids=region_face_ids,
+            selected_opening=selected_opening,
+            selected_edges=selected_edges,
+            selected_axis=selected_axis,
+            selected_center=selected_center,
+            selected_radius=float(selected_radius),
+            median_edge_length=float(median_edge_length),
+            min_ring_points=int(min_ring_points),
+            min_radius=float(min_radius),
+            max_candidates=12,
+        ):
+            edge_band_candidate_count += 1
+            _consider_opposite_candidate(
+                source=str(source),
+                source_index=int(source_index),
+                candidate=candidate,
+                source_edges=set(source_edges),
+            )
+
+    # v1.6.4 semantic correction: an "opposite opening" for a through-bore
+    # means the far compatible opening on the same centerline, not merely the
+    # highest scoring nearby rim/seam.  Damaged bores often contain internal
+    # defect rings or mid-depth edge bands that fit the radius and axis well;
+    # those are support/defect evidence, not the opposite mouth.  Prefer the
+    # farthest valid compatible candidate first, then score.
+    def _opposite_sort_key(item: tuple[float, BoreOpeningMeasurement, dict[str, object]]) -> tuple[float, float, float]:
+        score, _candidate, diag = item
+        abs_sep = float(diag.get("abs_axial_separation", 0.0) or 0.0)
+        radius_delta = float(diag.get("radius_delta_rel", 1.0) or 1.0)
+        centerline_distance = float(diag.get("centerline_distance", 1.0e9) or 1.0e9)
+        # Larger separation wins; score breaks ties; smaller radius/center error
+        # stabilizes the result when two rings are almost equally far.
+        return (abs_sep, float(score), -radius_delta - 0.001 * centerline_distance)
+
+    candidates.sort(key=_opposite_sort_key, reverse=True)
+    all_candidate_diagnostics.sort(key=lambda item: (-float(item.get("abs_axial_separation", 0.0) or 0.0), -float(item.get("score", -1.0e9) or -1.0e9), str(item.get("source", ""))))
+    candidate_diagnostics = tuple(dict(item[2]) for item in candidates[:12])
+    rejected_candidate_diagnostics = tuple(dict(item) for item in all_candidate_diagnostics[:12])
+    if not candidates:
+        return BoreTwoOpeningMeasurement(
+            selected_opening=selected_opening,
+            opposite_opening=None,
+            valid=False,
+            center=selected_opening.center,
+            axis=selected_opening.axis,
+            radius=float(selected_opening.radius),
+            diameter=float(2.0 * float(selected_opening.radius)),
+            depth=0.0,
+            opening_center=selected_opening.center,
+            opposite_center=selected_opening.center,
+            axial_min=0.0,
+            axial_max=0.0,
+            confidence=0.0,
+            diagnostics={
+                "mode": "two_opening_bore_frame_measurement",
+                "semantic_stage": "selected_opening_to_opposite_opening_to_measured_bore_frame",
+                "valid": False,
+                "opposite_opening_found": False,
+                "boundary_loop_count": int(seen_loop_count),
+                "opposite_candidate_count": 0,
+                "edge_band_candidate_count": int(edge_band_candidate_count),
+                "opposite_candidate_rejection_diagnostics": rejected_candidate_diagnostics,
+                "rejection_reason": "no_boundary_loop_candidate_satisfied_opposite_opening_rules",
+                "forbidden_transfer": "Do not use RegionData axial extent as opposite opening; no opposite opening means no bore-wall ownership.",
+            },
+        )
+
+    _score, opposite, best_diag = candidates[0]
+    p0 = selected_center
+    p1 = np.asarray(opposite.center, dtype=float).reshape(3)
+    vec = p1 - p0
+    length = float(np.linalg.norm(vec))
+    if not np.isfinite(length) or length <= 1.0e-12:
+        axis = selected_axis
+        depth = 0.0
+    else:
+        axis = vec / length
+        depth = length
+    radius = float(np.median(np.asarray([float(selected_opening.radius), float(opposite.radius)], dtype=float)))
+    radius_delta_rel = abs(float(selected_opening.radius) - float(opposite.radius)) / max(radius, 1.0e-9)
+    confidence = clamp(
+        0.40 * float(selected_opening.confidence)
+        + 0.35 * float(opposite.confidence)
+        + 0.15 * (1.0 - clamp(radius_delta_rel / 0.45, 0.0, 1.0))
+        + 0.10 * clamp(depth / max(1.50 * max(radius, 1.0e-9), 1.0e-9), 0.0, 1.0),
+        0.0,
+        1.0,
+    )
+    return BoreTwoOpeningMeasurement(
+        selected_opening=selected_opening,
+        opposite_opening=opposite,
+        valid=True,
+        center=to_vector3(p0),
+        axis=to_vector3(axis),
+        radius=radius,
+        diameter=float(2.0 * radius),
+        depth=float(depth),
+        opening_center=to_vector3(p0),
+        opposite_center=to_vector3(p1),
+        axial_min=0.0,
+        axial_max=float(depth),
+        confidence=float(confidence),
+        diagnostics={
+            "mode": "two_opening_bore_frame_measurement",
+            "semantic_stage": "selected_opening_to_opposite_opening_to_measured_bore_frame",
+            "valid": True,
+            "opposite_opening_found": True,
+            "boundary_loop_count": int(seen_loop_count),
+            "opposite_candidate_count": int(len(candidates)),
+            "edge_band_candidate_count": int(edge_band_candidate_count),
+            "best_opposite_candidate": dict(best_diag),
+            "candidate_rankings": candidate_diagnostics,
+            "opposite_candidate_rejection_diagnostics": rejected_candidate_diagnostics,
+            "selected_opening_radius": float(selected_opening.radius),
+            "opposite_opening_radius": float(opposite.radius),
+            "radius_delta_rel": float(radius_delta_rel),
+            "depth": float(depth),
+            "axis_hint": axis_hint(axis),
+            "forbidden_transfer": "Measured two-opening bore frame is evidence only; Recognition must still own wall faces before CandidateData.",
+        },
+    )
 
 def measure_bore_region(
     mesh: trimesh.Trimesh,
@@ -1200,8 +2008,11 @@ __all__ = [
     "EdgeKey",
     "BoreOpeningMeasurement",
     "BoreRegionMeasurement",
+    "BoreTwoOpeningMeasurement",
     "measure_bore_opening",
     "measure_bore_opening_candidates",
+    "measure_bore_opening_component_candidates",
+    "measure_two_opening_bore_frame",
     "measure_bore_region",
     "measure_bore_from_region_faces",
     "build_edge_table",

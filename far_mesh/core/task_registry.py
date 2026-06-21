@@ -1693,20 +1693,29 @@ def _handle_bore_clean_preview(payload: TaskPayload) -> TaskPayload:
 
 
 def _handle_bore_rebuild_candidate(payload: TaskPayload) -> TaskPayload:
-    """Run the selected Bore candidate rebuild in a spawned/core-safe task.
+    """Run an explicit Bore candidate rebuild in a spawned/core-safe task.
 
-    The task computes geometry only. It returns a RebuildResult-like payload for
-    MeshProcessor to validate and commit in the parent process, preserving host
-    authority over active mesh replacement, undo/redo, and project storage.
+    This handler is a transport/execution adapter only. It must not re-run Bore
+    recognition, reselect candidates by index, promote/reject candidates, or
+    reinterpret CandidateData. The selected candidate payload was produced by
+    the BoreTool facade; ``rebuild_bore_candidate`` owns candidate-view
+    normalization and rebuild gating. MeshProcessor remains responsible for
+    validating and committing the returned mesh in the parent process.
     """
 
     mesh = _require_mesh(payload).copy()
     selected_edge_ids = _bore_selected_edge_ids_from_payload(payload)
 
-    from far_mesh.core.bore.tool import analyze_bore_candidates, rebuild_bore_candidate
+    raw_candidate = _first_value(payload, "candidate", "candidate_metadata", "candidate_view")
+    if not isinstance(raw_candidate, dict):
+        raise ValueError(
+            "BORE_REBUILD_CANDIDATE requires an explicit CandidateView/CandidateData payload. "
+            "The task handler coordinates execution only and does not re-run Bore recognition "
+            "or select candidates by index."
+        )
+    candidate_payload: dict[str, Any] = dict(raw_candidate)
 
-    display_result = analyze_bore_candidates(mesh, selected_edge_ids)
-    candidate, candidate_index = _select_bore_candidate_for_rebuild(display_result, payload)
+    from far_mesh.core.bore.tool import rebuild_bore_candidate
 
     quad_density_mode = str(payload.get("quad_density_mode") or payload.get("rebuild_density_mode") or "lean_pi_opening")
     color_rebuilt_faces = bool(payload.get("color_rebuilt_faces", True))
@@ -1714,7 +1723,7 @@ def _handle_bore_rebuild_candidate(payload: TaskPayload) -> TaskPayload:
 
     rebuild_kwargs: dict[str, Any] = {
         "edge_ids": selected_edge_ids,
-        "candidate": candidate,
+        "candidate": candidate_payload,
         "quad_density_mode": quad_density_mode,
         "color_rebuilt_faces": color_rebuilt_faces,
     }
@@ -1725,10 +1734,17 @@ def _handle_bore_rebuild_candidate(payload: TaskPayload) -> TaskPayload:
     diagnostics = dict(getattr(rebuild_result, "diagnostics", {}) or {})
     diagnostics.setdefault("execution_layer", "process_task")
     diagnostics.setdefault("task_kind", "bore_rebuild_candidate")
-    diagnostics.setdefault("candidate_index", int(candidate_index))
-    diagnostics.setdefault("candidate_id", str(getattr(candidate, "candidate_id", "")))
+    diagnostics.setdefault("candidate_authority", "explicit_payload_candidate_view")
+    diagnostics.setdefault("candidate_selection_policy", "no_task_handler_reanalysis_no_index_selection")
+    diagnostics.setdefault("candidate_id", str(candidate_payload.get("candidate_id") or candidate_payload.get("feature_id") or ""))
+    if "source_candidate_index_hint" in payload:
+        diagnostics.setdefault("source_candidate_index_hint", int(payload.get("source_candidate_index_hint") or 0))
 
-    return {
+    normalized_edge_ids = payload.get("normalized_edge_ids")
+    if normalized_edge_ids is None:
+        normalized_edge_ids = selected_edge_ids
+
+    out: TaskPayload = {
         "implemented": True,
         "operation": "bore_rebuild_candidate",
         "mesh": getattr(rebuild_result, "mesh", None),
@@ -1740,17 +1756,20 @@ def _handle_bore_rebuild_candidate(payload: TaskPayload) -> TaskPayload:
         "axis": _plain_result(getattr(rebuild_result, "axis", (0.0, 0.0, 1.0))),
         "radius": float(getattr(rebuild_result, "radius", 0.0) or 0.0),
         "diagnostics": _plain_result(diagnostics),
-        "candidate": candidate.to_dict(),
-        "candidate_metadata": candidate.to_dict(),
-        "candidate_index": int(candidate_index),
+        "candidate": _plain_result(candidate_payload),
+        "candidate_metadata": _plain_result(candidate_payload),
         "selected_edge_ids": list(selected_edge_ids),
-        "normalized_edge_ids": list(getattr(display_result, "normalized_edge_ids", selected_edge_ids)),
+        "normalized_edge_ids": _plain_result(normalized_edge_ids),
         "quad_density_mode": quad_density_mode,
         "notes": [
             "Bore candidate rebuild computed through Phase 6 BORE_REBUILD_CANDIDATE task.",
+            "Task handler used explicit CandidateView payload; no Bore recognition reanalysis or candidate-index selection was performed.",
             "MeshProcessor must validate and commit the returned mesh in the parent process.",
         ],
     }
+    if "source_candidate_index_hint" in payload:
+        out["source_candidate_index_hint"] = int(payload.get("source_candidate_index_hint") or 0)
+    return out
 
 
 def _bore_selected_edge_ids_from_payload(payload: TaskPayload) -> tuple[int, ...]:

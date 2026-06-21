@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
+import math
 import numpy as np
 import trimesh
 
@@ -57,6 +58,26 @@ class BoreRegionSelection:
     diagnostics: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _OpeningRimFrame:
+    """Neutral geometric frame for an inferred opening/rim loop.
+
+    This is Region Select evidence only.  It is not a BORE, not a CHAMFER,
+    and not a rebuild target.  It exists so a weak raw Ctrl-click edge cloud
+    can be normalized into the complete circular rim the operator indicated.
+    """
+
+    center: np.ndarray
+    axis: np.ndarray
+    radius: float
+    median_edge_length: float
+    fit_edge_count: int
+    fit_vertex_count: int
+    plane_rel_rms: float
+    radius_rel_rms: float
+
+
+
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
@@ -73,6 +94,130 @@ def region_faces(mesh: trimesh.Trimesh, edge_ids: Iterable[int]) -> tuple[int, .
     """Return RegionData/context faces anchored to selected edges."""
 
     return select_region_data(mesh, edge_ids).face_ids
+
+
+
+def normalize_opening_rim_edge_ids_from_arrays(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    edge_index_to_vertices: np.ndarray,
+    edge_to_faces: Mapping[EdgeKey, Iterable[int]] | None,
+    selected_edge_ids: Iterable[int],
+    min_loop_edges: int = 12,
+) -> tuple[tuple[int, ...], dict[str, object]]:
+    """Normalize raw edge IDs into neutral complete opening/rim evidence.
+
+    This is the Region Select authority used by the live Bore edge selector.
+    The caller may provide only one clicked edge or a small partial arc.  This
+    function does not classify a BORE or a CHAMFER; it only performs the neutral
+    meaning transform:
+
+        raw clicked edge evidence -> complete opening/rim edge IDs
+
+    It returns stable edge indices in the caller's ``edge_index_to_vertices``
+    table plus diagnostics.  If the rim cannot be inferred, it returns the raw
+    selected IDs rather than inventing a feature.
+    """
+
+    verts = np.asarray(vertices, dtype=float)
+    if verts.ndim != 2 or verts.shape[1] < 3:
+        return tuple(int(v) for v in tuple(selected_edge_ids or ()) if int(v) >= 0), {
+            "used": False,
+            "reason": "invalid_vertices",
+            "authority": "region_select_neutral_opening_rim",
+        }
+    verts = verts[:, :3]
+
+    face_arr = np.asarray(faces, dtype=np.int64) if faces is not None else np.empty((0, 3), dtype=np.int64)
+    if face_arr.ndim != 2 or face_arr.shape[1] < 3:
+        return tuple(int(v) for v in tuple(selected_edge_ids or ()) if int(v) >= 0), {
+            "used": False,
+            "reason": "invalid_faces",
+            "authority": "region_select_neutral_opening_rim",
+        }
+    face_arr = face_arr[:, :3]
+
+    edge_arr = np.asarray(edge_index_to_vertices, dtype=np.int64)
+    if edge_arr.ndim != 2 or edge_arr.shape[1] < 2:
+        return tuple(int(v) for v in tuple(selected_edge_ids or ()) if int(v) >= 0), {
+            "used": False,
+            "reason": "invalid_edge_index_to_vertices",
+            "authority": "region_select_neutral_opening_rim",
+        }
+    edge_arr = edge_arr[:, :2]
+
+    raw_ids = tuple(sorted({int(v) for v in tuple(selected_edge_ids or ()) if 0 <= int(v) < len(edge_arr)}))
+    if not raw_ids:
+        return (), {
+            "used": False,
+            "reason": "empty_selected_edge_ids",
+            "authority": "region_select_neutral_opening_rim",
+        }
+
+    edge_key_to_id: dict[EdgeKey, int] = {}
+    selected_edges: set[EdgeKey] = set()
+    for idx, edge in enumerate(edge_arr):
+        key = _normalize_edge((int(edge[0]), int(edge[1])))
+        edge_key_to_id[key] = int(idx)
+        if int(idx) in raw_ids:
+            selected_edges.add(key)
+
+    norm_edge_to_faces: dict[EdgeKey, tuple[int, ...]] = {}
+    if edge_to_faces:
+        for key, value in edge_to_faces.items():
+            try:
+                norm_key = _normalize_edge(key)
+                norm_edge_to_faces[norm_key] = tuple(int(v) for v in tuple(value or ()))
+            except Exception:
+                continue
+    else:
+        tmp: dict[EdgeKey, list[int]] = defaultdict(list)
+        for fid, face in enumerate(face_arr):
+            for key in _face_edges(face):
+                tmp[key].append(int(fid))
+        norm_edge_to_faces = {key: tuple(values) for key, values in tmp.items()}
+
+    normals = _face_normals_from_arrays(verts, face_arr)
+    edge_table = {
+        "edge_to_faces": norm_edge_to_faces,
+        "edge_key_to_id": edge_key_to_id,
+        "unique_edges": tuple(_normalize_edge(edge) for edge in edge_arr),
+    }
+
+    rim_edges, rim_ids, diag = _opening_rim_edges_from_selection(
+        mesh=None,  # not interpreted by the helper
+        selected_edges=selected_edges,
+        selected_edge_ids=raw_ids,
+        edge_table=edge_table,
+        vertices=verts,
+        faces=face_arr,
+        face_normals=normals,
+        min_loop_edges=int(min_loop_edges),
+    )
+
+    out_ids = tuple(int(v) for v in tuple(rim_ids or raw_ids) if 0 <= int(v) < len(edge_arr))
+    quality = _edge_cloud_graph_quality(rim_edges or selected_edges, verts)
+    return out_ids, {
+        **dict(diag or {}),
+        "authority": "region_select_neutral_opening_rim",
+        "raw_selected_edge_count": int(len(raw_ids)),
+        "normalized_edge_count": int(len(out_ids)),
+        "normalized_edge_graph_quality": quality,
+        "not_feature_recognition": True,
+    }
+
+
+def _face_normals_from_arrays(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Compute face normals from runtime arrays without needing a mesh object."""
+
+    tri = np.asarray(vertices, dtype=float)[np.asarray(faces, dtype=np.int64)[:, :3], :3]
+    raw = np.cross(tri[:, 1, :] - tri[:, 0, :], tri[:, 2, :] - tri[:, 0, :])
+    length = np.linalg.norm(raw, axis=1)
+    out = np.zeros_like(raw)
+    valid = np.isfinite(length) & (length > 1.0e-12)
+    out[valid] = raw[valid] / length[valid].reshape(-1, 1)
+    return out
 
 
 
@@ -439,6 +584,7 @@ def select_region_data(
 # -----------------------------------------------------------------------------
 
 
+
 def _opening_rim_edges_from_selection(
     *,
     mesh: trimesh.Trimesh,
@@ -450,13 +596,23 @@ def _opening_rim_edges_from_selection(
     face_normals: np.ndarray,
     min_loop_edges: int,
 ) -> tuple[set[EdgeKey], tuple[int, ...], dict[str, object]]:
-    """Return rim/opening evidence edges from the user selection.
+    """Return authoritative neutral opening/rim evidence from raw picked edges.
 
-    If the user already selected a meaningful rim cloud, use it directly.  If
-    the user picked only one/few edge segments, grow a local component of
-    boundary/crease edges connected to that pick.  This is opening inference, not
-    feature recognition.
+    The viewport/SelectionController may provide only a partial arc when the
+    operator Ctrl-clicks an inner chamfer seam or a plain bore rim.  That raw
+    selection is useful evidence, but it is not the BoreTool semantic selection.
+
+    Region Select owns this neutral meaning transform:
+
+        raw selected edge IDs -> normalized complete opening/rim edge evidence
+
+    This function therefore accepts raw selected edges only when the raw graph is
+    already a coherent rim.  Otherwise it reconstructs the same circular local
+    rim from boundary/crease evidence in the mesh.  The output still has no
+    feature identity: it is not a BORE, not a CHAMFER, and not a rebuild target.
     """
+
+    del mesh  # mesh object is intentionally not interpreted here; arrays/tables carry the neutral evidence.
 
     selected = {_normalize_edge(edge) for edge in tuple(selected_edges or ())}
     if not selected:
@@ -466,61 +622,785 @@ def _opening_rim_edges_from_selection(
     if not isinstance(edge_key_to_id, dict):
         edge_key_to_id = {}
 
-    if len(selected) >= max(3, int(min_loop_edges)):
-        ids = tuple(sorted(int(edge_key_to_id.get(edge, -1)) for edge in selected if int(edge_key_to_id.get(edge, -1)) >= 0))
-        return set(selected), ids or tuple(selected_edge_ids), {
+    min_edges = max(3, int(min_loop_edges))
+    raw_ok, raw_quality = _edge_cloud_is_coherent_opening_rim(
+        selected,
+        vertices=vertices,
+        min_loop_edges=min_edges,
+    )
+    if raw_ok:
+        ids = _edge_ids_from_keys(selected, edge_key_to_id) or tuple(selected_edge_ids)
+        return set(selected), ids, {
             "used": True,
-            "method": "raw_selected_edge_cloud_is_opening_rim",
+            "method": "raw_selected_edge_cloud_is_coherent_opening_rim",
             "selected_edge_count": int(len(selected)),
             "inferred_edge_count": int(len(selected)),
             "single_pick_growth_used": False,
+            "complete_circle_recovery_used": False,
+            "raw_edge_cloud_quality": raw_quality,
+            "not_feature_recognition": True,
         }
 
     candidate_edges = _feature_rim_candidate_edges(faces=faces, face_normals=face_normals, edge_table=edge_table)
     candidate_edges.update(selected)
 
-    components = _topology_connected_edge_components(candidate_edges)
+    # Region Select owns neutral rim completion.  The visible Ctrl-click chain can
+    # be only a short arc, and crease-only candidate edges can be fragmented on
+    # repaired/imported meshes.  For the final circular closure pass we therefore
+    # also allow every runtime mesh edge to be tested geometrically against the
+    # inferred opening frame.  This is not feature recognition: each edge still has
+    # to lie on the same local circle/plane and run tangentially around that circle.
+    all_scan_edges = {_normalize_edge(edge) for edge in tuple(edge_table.get("unique_edges", ()) or ())}
+    all_scan_edges.update(candidate_edges)
     selected_vertices = {int(v) for edge in selected for v in edge}
-    touching: list[set[EdgeKey]] = []
-    for comp in components:
-        comp_vertices = {int(v) for edge in comp for v in edge}
-        if comp_vertices & selected_vertices or bool(set(comp) & selected):
-            touching.append(set(comp))
+    selected_mid = _edge_cloud_midpoint(vertices, selected)
 
-    if not touching:
-        ids = tuple(sorted(int(edge_key_to_id.get(edge, -1)) for edge in selected if int(edge_key_to_id.get(edge, -1)) >= 0))
-        return set(selected), ids or tuple(selected_edge_ids), {
+    components = tuple(_topology_connected_edge_components(candidate_edges))
+    touching: list[set[EdgeKey]] = []
+    nearby: list[set[EdgeKey]] = []
+    median_selected_length = _median_edge_length(vertices, selected)
+    search_distance = max(12.0 * max(median_selected_length, 1.0e-9), 1.0e-6)
+
+    for comp in components:
+        comp_set = {_normalize_edge(edge) for edge in comp}
+        if not comp_set:
+            continue
+        comp_vertices = {int(v) for edge in comp_set for v in edge}
+        if comp_vertices & selected_vertices or bool(comp_set & selected):
+            touching.append(comp_set)
+            continue
+        # If topology does not connect through the exact picked vertices, still
+        # consider nearby crease/boundary components.  This covers repaired or
+        # imported meshes where the visible rim is split into many tiny arcs.
+        dist = _edge_cloud_distance_to_point(vertices, comp_set, selected_mid)
+        if np.isfinite(dist) and dist <= search_distance:
+            nearby.append(comp_set)
+
+    candidate_components = touching or nearby
+    if not candidate_components:
+        ids = _edge_ids_from_keys(selected, edge_key_to_id) or tuple(selected_edge_ids)
+        return set(selected), ids, {
             "used": False,
-            "method": "single_pick_rim_growth",
-            "reason": "no_touching_feature_edge_component",
+            "method": "selected_edge_to_complete_neutral_opening_rim",
+            "reason": "no_touching_or_nearby_boundary_or_crease_component",
             "selected_edge_count": int(len(selected)),
             "inferred_edge_count": int(len(selected)),
+            "raw_edge_cloud_quality": raw_quality,
+            "candidate_feature_edge_count": int(len(candidate_edges)),
+            "not_feature_recognition": True,
         }
 
-    # Prefer the largest component that touches the picked edge.  For one-edge
-    # picks this is usually the full crease/boundary rim.  Keep a cap to avoid a
-    # whole model-wide crease network becoming the opening.
-    touching.sort(key=lambda comp: len(comp), reverse=True)
-    chosen = set(touching[0])
-    max_reasonable_edges = max(24, int(min_loop_edges) * 24)
+    max_reasonable_edges = max(32, int(min_edges) * 32)
+    scored: list[tuple[float, int, set[EdgeKey], dict[str, object]]] = []
+    for comp in candidate_components:
+        completed, complete_diag = _complete_opening_rim_component_geometrically(
+            component=comp,
+            all_candidate_edges=all_scan_edges,
+            selected_edges=selected,
+            selected_vertices=selected_vertices,
+            vertices=vertices,
+            min_loop_edges=min_edges,
+            max_reasonable_edges=max_reasonable_edges,
+        )
+        score, quality = _score_opening_rim_component(
+            completed,
+            selected_edges=selected,
+            selected_vertices=selected_vertices,
+            vertices=vertices,
+            min_loop_edges=min_edges,
+            max_reasonable_edges=max_reasonable_edges,
+        )
+        merged_quality = {**quality, "complete_circle_recovery": complete_diag}
+        scored.append((float(score), int(len(completed)), set(completed), merged_quality))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    chosen = set(scored[0][2])
+    chosen_quality = dict(scored[0][3])
+
     cap_applied = False
     if len(chosen) > max_reasonable_edges:
         chosen = _local_edge_component_subset(chosen, selected, vertices, max_edges=max_reasonable_edges)
         cap_applied = True
+        chosen_quality = {**chosen_quality, "post_cap_quality": _edge_cloud_graph_quality(chosen, vertices)}
 
-    ids = tuple(sorted(int(edge_key_to_id.get(edge, -1)) for edge in chosen if int(edge_key_to_id.get(edge, -1)) >= 0))
-    return chosen, ids or tuple(selected_edge_ids), {
+    ids = _edge_ids_from_keys(chosen, edge_key_to_id) or tuple(selected_edge_ids)
+    return chosen, ids, {
         "used": True,
-        "method": "selected_edge_to_local_boundary_or_crease_rim_component",
+        "method": "selected_edge_to_complete_neutral_opening_rim",
         "selected_edge_count": int(len(selected)),
         "candidate_feature_edge_count": int(len(candidate_edges)),
         "touching_component_count": int(len(touching)),
+        "nearby_component_count": int(len(nearby)),
         "inferred_edge_count": int(len(chosen)),
         "cap_applied": bool(cap_applied),
         "single_pick_growth_used": True,
+        "complete_circle_recovery_used": True,
+        "raw_edge_cloud_quality": raw_quality,
+        "chosen_edge_cloud_quality": chosen_quality,
+        "chosen_component_score": float(scored[0][0]),
         "not_feature_recognition": True,
     }
 
+
+
+def _edge_ids_from_keys(edges: Iterable[EdgeKey], edge_key_to_id: Mapping[object, object]) -> tuple[int, ...]:
+    """Return stable mesh edge IDs for normalized edge keys."""
+
+    ids: list[int] = []
+    for edge in sorted({_normalize_edge(edge) for edge in tuple(edges or ())}):
+        try:
+            idx = int(edge_key_to_id.get(edge, -1))  # type: ignore[attr-defined]
+        except Exception:
+            idx = -1
+        if idx >= 0:
+            ids.append(idx)
+    return tuple(sorted(set(ids)))
+
+
+
+def _edge_cloud_midpoint(vertices: np.ndarray, edges: Iterable[EdgeKey]) -> np.ndarray:
+    mids: list[np.ndarray] = []
+    verts = np.asarray(vertices, dtype=float)
+    for a, b in tuple(edges or ()):  # type: ignore[misc]
+        ia, ib = int(a), int(b)
+        if 0 <= ia < len(verts) and 0 <= ib < len(verts):
+            mids.append(0.5 * (verts[ia, :3] + verts[ib, :3]))
+    if not mids:
+        return np.zeros(3, dtype=float)
+    return np.asarray(mids, dtype=float).mean(axis=0)
+
+
+
+def _edge_cloud_distance_to_point(vertices: np.ndarray, edges: Iterable[EdgeKey], point: np.ndarray) -> float:
+    p = np.asarray(point, dtype=float).reshape(3)
+    best = float("inf")
+    verts = np.asarray(vertices, dtype=float)
+    for a, b in tuple(edges or ()):  # type: ignore[misc]
+        ia, ib = int(a), int(b)
+        if 0 <= ia < len(verts) and 0 <= ib < len(verts):
+            mid = 0.5 * (verts[ia, :3] + verts[ib, :3])
+            best = min(best, float(np.linalg.norm(mid - p)))
+    return float(best)
+
+
+
+def _edge_cloud_graph_quality(edges: Iterable[EdgeKey], vertices: np.ndarray) -> dict[str, object]:
+    """Neutral graph quality for an edge cloud.
+
+    The result describes whether the cloud is a coherent loop/near-loop.  It is
+    deliberately feature-agnostic: no BORE/CHAMFER classification is performed.
+    """
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    components = tuple(_topology_connected_edge_components(edge_set))
+    degree: dict[int, int] = defaultdict(int)
+    lengths: list[float] = []
+    verts = np.asarray(vertices, dtype=float)
+    for a, b in edge_set:
+        degree[int(a)] += 1
+        degree[int(b)] += 1
+        if 0 <= int(a) < len(verts) and 0 <= int(b) < len(verts):
+            length = float(np.linalg.norm(verts[int(a), :3] - verts[int(b), :3]))
+            if np.isfinite(length) and length > 1.0e-12:
+                lengths.append(length)
+    endpoints = tuple(sorted(int(v) for v, d in degree.items() if int(d) == 1))
+    branch_vertices = tuple(sorted(int(v) for v, d in degree.items() if int(d) > 2))
+    median_length = float(np.median(np.asarray(lengths, dtype=float))) if lengths else 0.0
+    endpoint_gap = 0.0
+    if len(endpoints) == 2:
+        a, b = endpoints
+        if 0 <= int(a) < len(verts) and 0 <= int(b) < len(verts):
+            endpoint_gap = float(np.linalg.norm(verts[int(a), :3] - verts[int(b), :3]))
+    closed = bool(edge_set) and len(components) == 1 and all(int(d) == 2 for d in degree.values())
+    near_closed = bool(
+        edge_set
+        and len(components) == 1
+        and len(branch_vertices) == 0
+        and len(endpoints) in (0, 2)
+        and (
+            len(endpoints) == 0
+            or (median_length > 0.0 and endpoint_gap <= max(3.5 * median_length, 1.0e-9))
+        )
+    )
+    component_edge_counts = tuple(int(len(comp)) for comp in components)
+    largest_component_edges = int(max(component_edge_counts) if component_edge_counts else 0)
+    return {
+        "edge_count": int(len(edge_set)),
+        "vertex_count": int(len(degree)),
+        "component_count": int(len(components)),
+        "component_edge_counts": component_edge_counts,
+        "largest_component_edges": int(largest_component_edges),
+        "largest_component_fraction": float(largest_component_edges) / max(float(len(edge_set)), 1.0),
+        "closed": bool(closed),
+        "near_closed": bool(near_closed),
+        "open_endpoint_count": int(len(endpoints)),
+        "branch_vertex_count": int(len(branch_vertices)),
+        "median_edge_length": float(median_length),
+        "endpoint_gap": float(endpoint_gap),
+    }
+
+
+
+def _edge_cloud_is_coherent_opening_rim(edges: Iterable[EdgeKey], *, vertices: np.ndarray, min_loop_edges: int) -> tuple[bool, dict[str, object]]:
+    """Return whether raw selected edges are already good rim evidence."""
+
+    quality = _edge_cloud_graph_quality(edges, vertices)
+    edge_count = int(quality.get("edge_count", 0))
+    ok = bool(
+        edge_count >= max(3, int(min_loop_edges))
+        and int(quality.get("component_count", 0)) == 1
+        and int(quality.get("branch_vertex_count", 0)) == 0
+        and bool(quality.get("near_closed", False))
+    )
+    quality = {**quality, "accepted_as_raw_opening_rim": bool(ok)}
+    return bool(ok), quality
+
+
+
+def _score_opening_rim_component(
+    edges: Iterable[EdgeKey],
+    *,
+    selected_edges: set[EdgeKey],
+    selected_vertices: set[int],
+    vertices: np.ndarray,
+    min_loop_edges: int,
+    max_reasonable_edges: int,
+) -> tuple[float, dict[str, object]]:
+    """Score a candidate edge component as normalized rim evidence.
+
+    Selection overlap keeps the chosen component anchored to the user's pick;
+    loop quality keeps us from choosing an arbitrary large crease network.
+    """
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    quality = _edge_cloud_graph_quality(edge_set, vertices)
+    comp_vertices = {int(v) for edge in edge_set for v in edge}
+    edge_overlap = len(edge_set & selected_edges)
+    vertex_overlap = len(comp_vertices & selected_vertices)
+    edge_count = int(quality.get("edge_count", 0))
+
+    score = 0.0
+    if bool(quality.get("closed", False)):
+        score += 10000.0
+    elif bool(quality.get("near_closed", False)):
+        score += 6500.0
+    if edge_count >= max(3, int(min_loop_edges)):
+        score += 1500.0
+    score += float(min(edge_count, max_reasonable_edges))
+    score += float(edge_overlap) * 180.0
+    score += float(vertex_overlap) * 32.0
+    score -= float(quality.get("branch_vertex_count", 0)) * 700.0
+    score -= float(max(0, int(quality.get("open_endpoint_count", 0)) - 2)) * 250.0
+    if edge_count > max_reasonable_edges:
+        score -= float(edge_count - max_reasonable_edges) * 4.0
+
+    return float(score), {
+        **quality,
+        "selected_edge_overlap": int(edge_overlap),
+        "selected_vertex_overlap": int(vertex_overlap),
+        "score": float(score),
+    }
+
+
+
+def _complete_opening_rim_component_geometrically(
+    *,
+    component: Iterable[EdgeKey],
+    all_candidate_edges: Iterable[EdgeKey],
+    selected_edges: set[EdgeKey],
+    selected_vertices: set[int],
+    vertices: np.ndarray,
+    min_loop_edges: int,
+    max_reasonable_edges: int,
+) -> tuple[set[EdgeKey], dict[str, object]]:
+    """Complete one local boundary/crease component into a same-circle rim.
+
+    This is Region Select's neutral rim closure transform.  It deliberately does
+    not ask what feature the rim belongs to.  A raw Ctrl-click can be a small arc
+    on an inner chamfer seam or a plain bore opening.  The meaning transform here
+    is only:
+
+        raw edge evidence -> complete opening/rim loop evidence
+
+    The older implementation selected the best connected component of the
+    same-circle edge band.  That made the live selection stay as a partial arc on
+    repaired triangulations where the real circular rim is split into several
+    edge components.  The fixed implementation first tries to recover the full
+    angular 360-degree same-circle band, then falls back to component scoring only
+    when the angular evidence is genuinely partial.
+    """
+
+    comp = {_normalize_edge(edge) for edge in tuple(component or ())}
+    if not comp:
+        return set(selected_edges), {"used": False, "reason": "empty_component"}
+
+    # Prefer a frame from the touching/nearby component.  If that component is too
+    # small, selected edges still provide the fallback seed.
+    frame_seed = set(comp)
+    if len(frame_seed) < max(3, int(min_loop_edges)):
+        frame_seed.update(selected_edges)
+    frame = _fit_opening_rim_frame(vertices=vertices, edges=frame_seed)
+    if frame is None:
+        return set(comp), {
+            "used": False,
+            "reason": "no_opening_frame_from_component",
+            "component_edge_count": int(len(comp)),
+        }
+
+    same_circle = _same_circle_candidate_edges(
+        vertices=vertices,
+        edges=all_candidate_edges,
+        frame=frame,
+        selected_edges=selected_edges,
+        max_reasonable_edges=max_reasonable_edges,
+    )
+    same_circle.update(selected_edges)
+    if len(same_circle) < max(3, int(min_loop_edges)):
+        return set(comp), {
+            "used": False,
+            "reason": "same_circle_band_too_small",
+            "component_edge_count": int(len(comp)),
+            "same_circle_edge_count": int(len(same_circle)),
+            "frame": _opening_rim_frame_diagnostics(frame),
+        }
+
+    # First authority: angular closure around the fitted neutral circle.  This
+    # can return several disconnected edge components, but that is acceptable at
+    # this semantic stage: Region Select is normalizing rim evidence, not deriving
+    # a topological delete patch.  The returned edge IDs are exactly the full rim
+    # evidence the user indicated.
+    angular_edges, angular_diag = _angularly_closed_same_circle_rim(
+        vertices=vertices,
+        edges=same_circle,
+        frame=frame,
+        selected_edges=selected_edges,
+        min_loop_edges=int(min_loop_edges),
+        max_reasonable_edges=int(max_reasonable_edges),
+    )
+    angular_coverage = float(angular_diag.get("angular_coverage", 0.0))
+    angular_component_count = int(angular_diag.get("component_count", 0))
+    angular_edge_count = int(len(angular_edges))
+    if angular_edge_count >= max(3, int(min_loop_edges)) and angular_coverage >= 0.78:
+        return set(angular_edges), {
+            "used": True,
+            "method": "same_circle_angular_closed_rim_from_region_select_frame",
+            "component_edge_count": int(len(comp)),
+            "same_circle_edge_count": int(len(same_circle)),
+            "chosen_edge_count": int(len(angular_edges)),
+            "component_count": int(angular_component_count),
+            "angular_completion_used": True,
+            "angular_completion": dict(angular_diag),
+            "frame": _opening_rim_frame_diagnostics(frame),
+            "not_feature_recognition": True,
+        }
+
+    # Fallback: choose the best connected component anchored to the selected
+    # evidence.  This preserves conservative behavior when the mesh really only
+    # provides a partial rim.
+    selected_mid = _edge_cloud_midpoint(vertices, selected_edges)
+    components = tuple(_topology_connected_edge_components(same_circle))
+    best_component: set[EdgeKey] = set()
+    best_score = -1.0e18
+    best_quality: dict[str, object] = {}
+    for raw_comp in components:
+        comp_set = {_normalize_edge(edge) for edge in raw_comp}
+        comp_vertices = {int(v) for edge in comp_set for v in edge}
+        edge_overlap = len(comp_set & selected_edges)
+        vertex_overlap = len(comp_vertices & selected_vertices)
+        distance = _edge_cloud_distance_to_point(vertices, comp_set, selected_mid)
+        quality = _edge_cloud_graph_quality(comp_set, vertices)
+        comp_angular = _angular_coverage_diagnostics(vertices=vertices, edges=comp_set, frame=frame)
+        score = 0.0
+        if bool(quality.get("closed", False)):
+            score += 10000.0
+        elif bool(quality.get("near_closed", False)):
+            score += 6000.0
+        score += 3500.0 * float(comp_angular.get("angular_coverage", 0.0))
+        score += min(len(comp_set), max_reasonable_edges)
+        score += 900.0 * edge_overlap
+        score += 120.0 * vertex_overlap
+        score -= 2.0 * min(distance / max(frame.median_edge_length, 1.0e-9), 1000.0)
+        score -= 400.0 * int(quality.get("branch_vertex_count", 0))
+        if score > best_score:
+            best_score = float(score)
+            best_component = set(comp_set)
+            best_quality = {**quality, "angular": comp_angular}
+
+    if not best_component:
+        best_component = set(same_circle)
+
+    pruned = _prune_non_loop_tails(best_component)
+    if len(pruned) >= max(3, int(min_loop_edges)) and _component_is_still_anchored(pruned, selected_edges, selected_vertices):
+        chosen = pruned
+        pruned_used = True
+    else:
+        chosen = best_component
+        pruned_used = False
+
+    return chosen, {
+        "used": True,
+        "method": "same_circle_edge_band_from_region_select_frame",
+        "component_edge_count": int(len(comp)),
+        "same_circle_edge_count": int(len(same_circle)),
+        "chosen_edge_count": int(len(chosen)),
+        "component_count": int(len(components)),
+        "best_component_score": float(best_score),
+        "best_component_quality": best_quality,
+        "tail_pruning_used": bool(pruned_used),
+        "angular_completion_used": False,
+        "angular_completion": dict(angular_diag),
+        "frame": _opening_rim_frame_diagnostics(frame),
+        "not_feature_recognition": True,
+    }
+
+
+
+
+def _angularly_closed_same_circle_rim(
+    *,
+    vertices: np.ndarray,
+    edges: Iterable[EdgeKey],
+    frame: _OpeningRimFrame,
+    selected_edges: set[EdgeKey],
+    min_loop_edges: int,
+    max_reasonable_edges: int,
+) -> tuple[set[EdgeKey], dict[str, object]]:
+    """Return the full angular same-circle rim if the edge band covers the circle.
+
+    This is the final neutral closure pass.  The topological chain may be broken,
+    but the circle is still present in the mesh as a set of same-plane,
+    same-radius, tangential edges.  We use angular coverage rather than connected
+    component closure so inner rims and plain bore openings are not reduced to a
+    visible partial arc.
+    """
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    if len(edge_set) < max(3, int(min_loop_edges)):
+        return set(edge_set), {"used": False, "reason": "too_few_edges", "edge_count": int(len(edge_set))}
+
+    scored: list[tuple[float, float, EdgeKey]] = []
+    for edge in edge_set:
+        score, angle = _same_circle_edge_score_and_angle(vertices=vertices, edge=edge, frame=frame)
+        if not np.isfinite(score) or not np.isfinite(angle):
+            continue
+        # Selected edges are raw evidence; keep them even if the local tangent is
+        # slightly weak.  Unselected edges must look like real rim edges.
+        if edge not in selected_edges and score < 0.48:
+            continue
+        scored.append((float(score), float(angle), edge))
+
+    if len(scored) < max(3, int(min_loop_edges)):
+        return set(edge_set), {
+            "used": False,
+            "reason": "too_few_scored_same_circle_edges",
+            "edge_count": int(len(edge_set)),
+            "scored_edge_count": int(len(scored)),
+        }
+
+    # Collapse duplicate/competing candidates per angular cell only when the band
+    # is very dense.  For normal tessellated rims this keeps nearly all actual rim
+    # edges.  For fan/chord clutter it keeps the best tangential edge per sector.
+    bin_count = _angular_bin_count(frame=frame, edge_count=len(scored))
+    bins: dict[int, tuple[float, float, EdgeKey]] = {}
+    for score, angle, edge in scored:
+        idx = int(np.floor((angle % (2.0 * math.pi)) / (2.0 * math.pi) * float(bin_count))) % int(bin_count)
+        current = bins.get(idx)
+        # Prefer selected evidence and then the highest geometric score.
+        boosted_score = float(score) + (0.20 if edge in selected_edges else 0.0)
+        if current is None or boosted_score > float(current[0]) + (0.20 if current[2] in selected_edges else 0.0):
+            bins[idx] = (float(score), float(angle), edge)
+
+    chosen = {edge for _score, _angle, edge in bins.values()}
+    # If binning became too lossy on a coarse rim, use all scored edges.  This is
+    # common on simple OBJ test cylinders where the real rim has one edge per
+    # angular step.
+    if len(chosen) < max(3, int(min_loop_edges)) and len(scored) <= int(max_reasonable_edges):
+        chosen = {edge for _score, _angle, edge in scored}
+
+    if len(chosen) > int(max_reasonable_edges):
+        ordered = sorted(
+            ((_same_circle_edge_score_and_angle(vertices=vertices, edge=edge, frame=frame)[0], edge) for edge in chosen),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        chosen = {edge for _score, edge in ordered[: int(max_reasonable_edges)]}
+
+    coverage = _angular_coverage_diagnostics(vertices=vertices, edges=chosen, frame=frame)
+    components = tuple(_topology_connected_edge_components(chosen))
+    return chosen, {
+        "used": True,
+        "edge_count": int(len(chosen)),
+        "input_edge_count": int(len(edge_set)),
+        "scored_edge_count": int(len(scored)),
+        "bin_count": int(bin_count),
+        "occupied_bin_count": int(len(bins)),
+        "component_count": int(len(components)),
+        **coverage,
+    }
+
+
+
+def _same_circle_edge_score_and_angle(*, vertices: np.ndarray, edge: EdgeKey, frame: _OpeningRimFrame) -> tuple[float, float]:
+    edge = _normalize_edge(edge)
+    a, b = edge
+    if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+        return 0.0, float("nan")
+    p0 = vertices[int(a), :3]
+    p1 = vertices[int(b), :3]
+    vec = p1 - p0
+    length = float(np.linalg.norm(vec))
+    if not np.isfinite(length) or length <= 1.0e-12:
+        return 0.0, float("nan")
+    mid = 0.5 * (p0 + p1)
+    rel = mid - frame.center.reshape(3)
+    axial = float(np.dot(rel, frame.axis.reshape(3)))
+    radial_vec = rel - axial * frame.axis.reshape(3)
+    radial = float(np.linalg.norm(radial_vec))
+    if not np.isfinite(radial) or radial <= 1.0e-12:
+        return 0.0, float("nan")
+    plane_error = abs(axial)
+    radius_error = abs(radial - float(frame.radius))
+    plane_score = 1.0 - min(plane_error / max(frame.median_edge_length * 3.5, frame.radius * 0.075, 1.0e-9), 1.0)
+    radius_score = 1.0 - min(radius_error / max(frame.median_edge_length * 4.5, frame.radius * 0.090, 1.0e-9), 1.0)
+    tangent = _edge_tangent_alignment_to_frame(vertices, edge, frame)
+    length_score = 1.0 - min(max(length - frame.median_edge_length * 4.0, 0.0) / max(frame.radius, 1.0e-9), 1.0)
+    score = 0.34 * tangent + 0.26 * plane_score + 0.30 * radius_score + 0.10 * length_score
+    u_axis, v_axis = _opening_frame_plane_basis(frame.axis)
+    angle = float(math.atan2(float(np.dot(radial_vec, v_axis)), float(np.dot(radial_vec, u_axis))))
+    if angle < 0.0:
+        angle += 2.0 * math.pi
+    return float(score), float(angle)
+
+
+
+def _angular_bin_count(*, frame: _OpeningRimFrame, edge_count: int) -> int:
+    circumference_bins = int(round((2.0 * math.pi * max(float(frame.radius), 1.0e-9)) / max(float(frame.median_edge_length), 1.0e-9)))
+    # Do not over-bin tiny/coarse rings; over-binning makes a complete ring look
+    # artificially incomplete.  Keep enough bins for the rim shape, but bound it.
+    value = max(24, min(384, max(int(edge_count), int(circumference_bins))))
+    return int(value)
+
+
+
+def _angular_coverage_diagnostics(*, vertices: np.ndarray, edges: Iterable[EdgeKey], frame: _OpeningRimFrame) -> dict[str, object]:
+    angles: list[float] = []
+    for edge in {_normalize_edge(e) for e in tuple(edges or ())}:
+        _score, angle = _same_circle_edge_score_and_angle(vertices=vertices, edge=edge, frame=frame)
+        if np.isfinite(angle):
+            angles.append(float(angle) % (2.0 * math.pi))
+    if len(angles) < 2:
+        return {
+            "angular_coverage": 0.0,
+            "largest_gap_degrees": 360.0,
+            "angle_sample_count": int(len(angles)),
+        }
+    arr = np.asarray(sorted(angles), dtype=float)
+    gaps = np.diff(np.concatenate((arr, arr[:1] + 2.0 * math.pi)))
+    largest_gap = float(np.max(gaps)) if gaps.size else 2.0 * math.pi
+    coverage = 1.0 - min(max(largest_gap / (2.0 * math.pi), 0.0), 1.0)
+    return {
+        "angular_coverage": float(coverage),
+        "largest_gap_degrees": float(math.degrees(largest_gap)),
+        "angle_sample_count": int(len(angles)),
+    }
+
+
+
+def _opening_frame_plane_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    normal = _unit_vector(axis, fallback=(0.0, 0.0, 1.0))
+    reference = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(reference, normal))) > 0.90:
+        reference = np.array([0.0, 1.0, 0.0], dtype=float)
+    u_axis = _unit_vector(np.cross(normal, reference), fallback=(0.0, 1.0, 0.0))
+    v_axis = _unit_vector(np.cross(normal, u_axis), fallback=(1.0, 0.0, 0.0))
+    return u_axis, v_axis
+
+
+
+
+def _fit_opening_rim_frame(*, vertices: np.ndarray, edges: Iterable[EdgeKey]) -> _OpeningRimFrame | None:
+    """Fit a neutral circular rim frame from edge vertices."""
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    vertex_ids = tuple(sorted({int(v) for edge in edge_set for v in edge if 0 <= int(v) < len(vertices)}))
+    if len(vertex_ids) < 4:
+        return None
+
+    pts = np.asarray(vertices, dtype=float)[np.asarray(vertex_ids, dtype=np.int64), :3]
+    center0 = pts.mean(axis=0)
+    centered = pts - center0.reshape(1, 3)
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = _unit_vector(vh[-1], fallback=(0.0, 0.0, 1.0))
+    except Exception:
+        return None
+
+    reference = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(reference, axis))) > 0.90:
+        reference = np.array([0.0, 1.0, 0.0], dtype=float)
+    u_axis = _unit_vector(np.cross(axis, reference), fallback=(0.0, 1.0, 0.0))
+    v_axis = _unit_vector(np.cross(axis, u_axis), fallback=(1.0, 0.0, 0.0))
+
+    xy = np.column_stack((centered @ u_axis, centered @ v_axis))
+    try:
+        mat = np.column_stack((xy[:, 0], xy[:, 1], np.ones(len(xy))))
+        rhs = -(xy[:, 0] * xy[:, 0] + xy[:, 1] * xy[:, 1])
+        sol, *_ = np.linalg.lstsq(mat, rhs, rcond=None)
+        cx = -0.5 * float(sol[0])
+        cy = -0.5 * float(sol[1])
+        radius_sq = max(0.0, cx * cx + cy * cy - float(sol[2]))
+        radius = float(np.sqrt(radius_sq))
+        center = center0 + cx * u_axis + cy * v_axis
+    except Exception:
+        rel = centered - np.outer(centered @ axis, axis)
+        radii = np.linalg.norm(rel, axis=1)
+        valid = radii[np.isfinite(radii) & (radii > 1.0e-12)]
+        if valid.size < 3:
+            return None
+        radius = float(np.median(valid))
+        center = center0
+
+    median_len = _median_edge_length(vertices, edge_set)
+    if median_len <= 0.0:
+        median_len = 1.0
+    if not np.isfinite(radius) or radius <= max(1.0e-9, 1.25 * median_len):
+        return None
+
+    rel = pts - center.reshape(1, 3)
+    plane_dist = rel @ axis.reshape(3)
+    radial_vec = rel - np.outer(plane_dist, axis)
+    radii = np.linalg.norm(radial_vec, axis=1)
+    plane_rms = float(np.sqrt(np.mean(plane_dist * plane_dist))) if plane_dist.size else 0.0
+    radius_rms = float(np.sqrt(np.mean((radii - radius) * (radii - radius)))) if radii.size else 0.0
+    plane_rel_rms = plane_rms / max(float(radius), 1.0e-9)
+    radius_rel_rms = radius_rms / max(float(radius), 1.0e-9)
+
+    # Reject frames clearly fit to a broad surface/cloud rather than one rim.
+    if plane_rel_rms > 0.35 or radius_rel_rms > 0.35:
+        return None
+
+    return _OpeningRimFrame(
+        center=np.asarray(center, dtype=float).reshape(3),
+        axis=np.asarray(canonical_axis(axis), dtype=float).reshape(3),
+        radius=float(radius),
+        median_edge_length=float(median_len),
+        fit_edge_count=int(len(edge_set)),
+        fit_vertex_count=int(len(vertex_ids)),
+        plane_rel_rms=float(plane_rel_rms),
+        radius_rel_rms=float(radius_rel_rms),
+    )
+
+
+
+def _same_circle_candidate_edges(
+    *,
+    vertices: np.ndarray,
+    edges: Iterable[EdgeKey],
+    frame: _OpeningRimFrame,
+    selected_edges: set[EdgeKey],
+    max_reasonable_edges: int,
+) -> set[EdgeKey]:
+    """Return candidate edges lying on the same neutral circle as ``frame``."""
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    max_plane_error = max(frame.median_edge_length * 3.5, frame.radius * 0.075)
+    max_radius_error = max(frame.median_edge_length * 4.5, frame.radius * 0.090)
+    max_edge_length = max(frame.median_edge_length * 8.0, frame.radius * 0.35)
+    out: set[EdgeKey] = set()
+    for edge in edge_set:
+        a, b = edge
+        if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+            continue
+        length = float(np.linalg.norm(vertices[int(a), :3] - vertices[int(b), :3]))
+        if not np.isfinite(length) or length <= 1.0e-12 or length > max_edge_length:
+            continue
+        mid = 0.5 * (vertices[int(a), :3] + vertices[int(b), :3])
+        rel = mid - frame.center.reshape(3)
+        plane_error = abs(float(np.dot(rel, frame.axis)))
+        radial_vec = rel - float(np.dot(rel, frame.axis)) * frame.axis.reshape(3)
+        radial = float(np.linalg.norm(radial_vec))
+        radius_error = abs(radial - frame.radius)
+        if edge not in selected_edges:
+            if plane_error > max_plane_error or radius_error > max_radius_error:
+                continue
+            tangent = _edge_tangent_alignment_to_frame(vertices, edge, frame)
+            if tangent < 0.30:
+                continue
+        out.add(edge)
+        if len(out) > max_reasonable_edges * 4:
+            # This is no longer one local rim; the caller will score/cap later,
+            # but do not allow a model-wide crease network to dominate runtime.
+            break
+    return out
+
+
+
+def _edge_tangent_alignment_to_frame(vertices: np.ndarray, edge: EdgeKey, frame: _OpeningRimFrame) -> float:
+    a, b = _normalize_edge(edge)
+    if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+        return 0.0
+    vec = vertices[int(b), :3] - vertices[int(a), :3]
+    length = float(np.linalg.norm(vec))
+    if length <= 1.0e-12:
+        return 0.0
+    edge_dir = vec / length
+    mid = 0.5 * (vertices[int(a), :3] + vertices[int(b), :3])
+    rel = mid - frame.center.reshape(3)
+    radial = rel - float(np.dot(rel, frame.axis)) * frame.axis.reshape(3)
+    radial_len = float(np.linalg.norm(radial))
+    if radial_len <= 1.0e-12:
+        return 0.0
+    tangent = np.cross(frame.axis.reshape(3), radial / radial_len)
+    tangent_len = float(np.linalg.norm(tangent))
+    if tangent_len <= 1.0e-12:
+        return 0.0
+    tangent = tangent / tangent_len
+    return float(abs(np.dot(edge_dir, tangent)))
+
+
+
+def _prune_non_loop_tails(edges: Iterable[EdgeKey]) -> set[EdgeKey]:
+    """Remove leaf tails from an edge set while preserving closed/near-closed loops."""
+
+    remaining = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    changed = True
+    while changed and remaining:
+        changed = False
+        degree: dict[int, int] = defaultdict(int)
+        for a, b in remaining:
+            degree[int(a)] += 1
+            degree[int(b)] += 1
+        leaves = {int(v) for v, deg in degree.items() if int(deg) <= 1}
+        if not leaves:
+            break
+        drop = {edge for edge in remaining if int(edge[0]) in leaves or int(edge[1]) in leaves}
+        if drop:
+            remaining.difference_update(drop)
+            changed = True
+    return remaining
+
+
+
+def _component_is_still_anchored(edges: Iterable[EdgeKey], selected_edges: set[EdgeKey], selected_vertices: set[int]) -> bool:
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    if edge_set & selected_edges:
+        return True
+    verts = {int(v) for edge in edge_set for v in edge}
+    return bool(verts & selected_vertices)
+
+
+
+def _opening_rim_frame_diagnostics(frame: _OpeningRimFrame) -> dict[str, object]:
+    return {
+        "center": _to_vector3(frame.center),
+        "axis": _to_vector3(frame.axis),
+        "radius": float(frame.radius),
+        "median_edge_length": float(frame.median_edge_length),
+        "fit_edge_count": int(frame.fit_edge_count),
+        "fit_vertex_count": int(frame.fit_vertex_count),
+        "plane_rel_rms": float(frame.plane_rel_rms),
+        "radius_rel_rms": float(frame.radius_rel_rms),
+    }
 
 
 def _feature_rim_candidate_edges(*, faces: np.ndarray, face_normals: np.ndarray, edge_table: Mapping[str, object]) -> set[EdgeKey]:

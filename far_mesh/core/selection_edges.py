@@ -1008,6 +1008,50 @@ def _estimate_confidence(mode, selected_count, connected_open_count, frame, star
 
 
 
+
+def _region_select_authoritative_bore_rim(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray | None,
+    edge_arr: np.ndarray,
+    edge_faces: Mapping[EdgeKey, list[int] | tuple[int, ...]] | None,
+    start_edge_index: int,
+    min_loop_edges: int,
+) -> tuple[tuple[int, ...], dict[str, object]] | None:
+    """Delegate Bore rim completion to Region Select without GUI authority.
+
+    This is deliberately a small bridge.  The geometric meaning transform lives
+    in ``far_mesh.core.bore.region_select`` so BoreTool owns the neutral rim
+    interpretation.  ``selection_edges.py`` only uses the returned edge IDs so
+    the live Ctrl-click selection can display the same complete rim that Region
+    Select will later use for RegionData.
+    """
+
+    if start_edge_index < 0 or start_edge_index >= len(edge_arr):
+        return None
+    if faces is None:
+        return None
+    try:
+        from .bore.region_select import normalize_opening_rim_edge_ids_from_arrays
+    except Exception:
+        return None
+    try:
+        rim_ids, diagnostics = normalize_opening_rim_edge_ids_from_arrays(
+            vertices=vertices,
+            faces=faces,
+            edge_index_to_vertices=edge_arr,
+            edge_to_faces=edge_faces,
+            selected_edge_ids=(int(start_edge_index),),
+            min_loop_edges=int(min_loop_edges),
+        )
+    except Exception as exc:
+        return None
+    rim_ids = tuple(sorted({int(v) for v in tuple(rim_ids or ()) if 0 <= int(v) < len(edge_arr)}))
+    if len(rim_ids) < int(min_loop_edges):
+        return None
+    return rim_ids, dict(diagnostics or {})
+
+
 # ----------------------------------------------------------------------
 # Dedicated Bore opening selection helpers
 # ----------------------------------------------------------------------
@@ -1046,6 +1090,39 @@ def _select_bore_opening_edge_region(
     vertex_to_edges = _vertex_to_edges(edge_arr)
     start_key = _edge_key(edge_arr[int(start_edge_index)])
 
+    # Region Select is the BoreTool authority for neutral opening/rim meaning.
+    # The viewport may provide only one clicked edge or a partial arc here; ask
+    # Region Select to normalize that raw evidence into the complete circular
+    # rim before falling back to the legacy local-chain selector.  This does not
+    # recognize a BORE or CHAMFER.  It only returns edge IDs for the user-indicated
+    # opening/rim loop.
+    region_select_result = _region_select_authoritative_bore_rim(
+        vertices=vertices_arr,
+        faces=faces_arr,
+        edge_arr=edge_arr,
+        edge_faces=edge_faces,
+        start_edge_index=int(start_edge_index),
+        min_loop_edges=12,
+    )
+    if region_select_result is not None:
+        edge_ids, rs_diag = region_select_result
+        if len(edge_ids) >= 12:
+            return EdgeSelectionRegion(
+                edge_ids=tuple(sorted(int(v) for v in edge_ids)),
+                confidence=float(min(0.97, max(0.72, 0.50 + 0.01 * min(len(edge_ids), 32)))),
+                mode="bore_opening_loop",
+                diagnostics={
+                    "strategy": "bore_rim",
+                    "bore_opening_source": "region_select_authoritative_neutral_rim",
+                    "region_select_authority": True,
+                    "selected_edge_count": int(len(edge_ids)),
+                    "validated_loop_found": bool(
+                        (rs_diag.get("normalized_edge_graph_quality", {}) or {}).get("near_closed", False)
+                    ),
+                    "region_select_diagnostics": dict(rs_diag or {}),
+                },
+            )
+
     # Conservative first pass: gives us the clicked local feature/open path.
     safe = select_edge_region(
         vertices=vertices_arr,
@@ -1063,6 +1140,44 @@ def _select_bore_opening_edge_region(
     safe_keys = {_edge_key(edge_arr[int(eid)]) for eid in safe.edge_ids if 0 <= int(eid) < len(edge_arr)}
     if not safe_keys:
         safe_keys = {start_key}
+
+    # Coarse/tessellated mesh navigation path.  The conservative selector may
+    # return a broad raw edge cloud (hundreds of unrelated fragments).  Before
+    # any broad fallback is allowed to become visible selection, ask the Bore
+    # folder for a lightweight local rim resolver: clicked edge + conservative
+    # cloud -> compact rim edge IDs.  This is intentionally not RegionData, not
+    # Recognition, and not rebuild authority.
+    try:
+        from .bore.rim_resolver import resolve_bore_rim_edges_from_click_arrays
+
+        resolved_rim = resolve_bore_rim_edges_from_click_arrays(
+            vertices=vertices_arr,
+            faces=faces_arr,
+            edge_index_to_vertices=edge_arr,
+            edge_to_faces=edge_faces,
+            selected_edge_ids=tuple(int(v) for v in safe.edge_ids),
+            start_edge_index=int(start_edge_index),
+            min_loop_edges=8,
+            max_output_edges=(int(max_selected_edges) if max_selected_edges is not None and int(max_selected_edges) > 0 else 96),
+        )
+    except Exception:
+        resolved_rim = None
+    if resolved_rim is not None and len(tuple(resolved_rim.edge_ids or ())) >= 8:
+        return EdgeSelectionRegion(
+            edge_ids=tuple(sorted(int(v) for v in resolved_rim.edge_ids)),
+            confidence=float(resolved_rim.confidence),
+            mode="bore_opening_loop",
+            diagnostics={
+                "strategy": "bore_rim",
+                "bore_opening_source": str(resolved_rim.source),
+                "bore_local_rim_resolver_used": True,
+                "validated_loop_found": False,
+                "topological_cycle_required": False,
+                "selected_edge_count": int(len(resolved_rim.edge_ids)),
+                "safe_selected_edge_count": int(len(safe.edge_ids)),
+                "resolver_diagnostics": dict(resolved_rim.diagnostics or {}),
+            },
+        )
 
     # If the conservative pass already produced one real loop, keep it.
     safe_cycles = _bore_degree_two_cycles(safe_keys, min_loop_edges=12)
@@ -1103,15 +1218,16 @@ def _select_bore_opening_edge_region(
 
     if frame is None or not np.isfinite(frame.radius) or frame.radius <= 1.0e-12:
         return EdgeSelectionRegion(
-            edge_ids=safe.edge_ids,
-            confidence=min(float(safe.confidence), 0.58),
+            edge_ids=(int(start_edge_index),),
+            confidence=min(float(safe.confidence), 0.42),
             mode="bore_opening_unvalidated",
             diagnostics={
                 **safe.diagnostics,
                 "strategy": "bore_rim",
-                "bore_opening_source": "safe_fallback_no_frame",
+                "bore_opening_source": "single_edge_guard_no_frame",
                 "validated_loop_found": False,
                 "safe_selected_edge_count": len(safe.edge_ids),
+                "broad_safe_fallback_suppressed": True,
             },
         )
 
@@ -1129,16 +1245,17 @@ def _select_bore_opening_edge_region(
     if max_selected_edges is not None and int(max_selected_edges) > 0 and len(candidate_keys) > int(max_selected_edges):
         # Candidate graph is too large to be a single local opening.  Fall back.
         return EdgeSelectionRegion(
-            edge_ids=safe.edge_ids,
-            confidence=min(float(safe.confidence), 0.52),
+            edge_ids=(int(start_edge_index),),
+            confidence=min(float(safe.confidence), 0.40),
             mode="bore_opening_unvalidated",
             diagnostics={
                 **safe.diagnostics,
                 "strategy": "bore_rim",
-                "bore_opening_source": "safe_fallback_candidate_cap",
+                "bore_opening_source": "single_edge_guard_candidate_cap",
                 "validated_loop_found": False,
                 "candidate_edge_count": len(candidate_keys),
                 "max_selected_edges": int(max_selected_edges),
+                "broad_safe_fallback_suppressed": True,
             },
         )
 
@@ -1205,40 +1322,44 @@ def _select_bore_opening_edge_region(
     )
     if len(handoff_keys) >= 12:
         edge_ids = tuple(sorted(int(key_to_index[k]) for k in handoff_keys if k in key_to_index))
-        return EdgeSelectionRegion(
-            edge_ids=edge_ids,
-            confidence=0.50,
-            mode="bore_opening_measurement_handoff",
-            diagnostics={
-                "strategy": "bore_rim",
-                "bore_opening_source": "bounded_local_candidate_handoff",
-                "validated_loop_found": False,
-                "measurement_handoff": True,
-                "expensive_anchor_cycle_search_enabled": False,
-                "selected_edge_count": len(edge_ids),
-                "candidate_edge_count": len(candidate_keys),
-                "candidate_loop_count": len(cycles),
-                "safe_selected_edge_count": len(safe.edge_ids),
-                "ring_frame_available": True,
-                "frame_radius": float(frame.radius),
-                "frame_sample_count": int(frame.sample_count),
-            },
-        )
+        compact_handoff = bool(len(edge_ids) <= 96 and len(edge_ids) <= max(24, int(0.45 * max(len(safe.edge_ids), 1))))
+        if compact_handoff:
+            return EdgeSelectionRegion(
+                edge_ids=edge_ids,
+                confidence=0.50,
+                mode="bore_opening_measurement_handoff",
+                diagnostics={
+                    "strategy": "bore_rim",
+                    "bore_opening_source": "compact_bounded_local_candidate_handoff",
+                    "validated_loop_found": False,
+                    "measurement_handoff": True,
+                    "visual_selection_compact_guard_passed": True,
+                    "expensive_anchor_cycle_search_enabled": False,
+                    "selected_edge_count": len(edge_ids),
+                    "candidate_edge_count": len(candidate_keys),
+                    "candidate_loop_count": len(cycles),
+                    "safe_selected_edge_count": len(safe.edge_ids),
+                    "ring_frame_available": True,
+                    "frame_radius": float(frame.radius),
+                    "frame_sample_count": int(frame.sample_count),
+                },
+            )
 
     return EdgeSelectionRegion(
-        edge_ids=safe.edge_ids,
-        confidence=min(float(safe.confidence), 0.55),
+        edge_ids=(int(start_edge_index),),
+        confidence=min(float(safe.confidence), 0.40),
         mode="bore_opening_unvalidated",
         diagnostics={
             **safe.diagnostics,
             "strategy": "bore_rim",
-            "bore_opening_source": "safe_fallback_no_valid_cycle",
+            "bore_opening_source": "single_edge_guard_no_valid_cycle",
             "validated_loop_found": False,
             "measurement_handoff": False,
             "expensive_anchor_cycle_search_enabled": False,
             "candidate_edge_count": len(candidate_keys),
             "candidate_loop_count": len(cycles),
             "safe_selected_edge_count": len(safe.edge_ids),
+            "broad_safe_fallback_suppressed": True,
             "ring_frame_available": True,
             "frame_radius": float(frame.radius),
         },

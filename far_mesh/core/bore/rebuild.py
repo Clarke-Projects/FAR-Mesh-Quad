@@ -54,7 +54,7 @@ import trimesh
 
 from .rebuild_target import build_bounded_rebuild_target_face_sets
 from .region_select import select_region_data
-from .types import FeatureFamily, RecognitionStage, RegionData
+from .types import FeatureFamily, RecognitionStage, RegionData, tuple_ints
 from .topology import (
     boundary_edges_for_face_patch,
     build_edge_to_faces,
@@ -138,6 +138,7 @@ class RebuildCandidateContext:
     candidate_has_preview_face_patch: bool
     allows_unequal_loop_transition: bool
     quad_density_mode: str
+    damaged_bore_rebuild_trial: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,24 +240,93 @@ def delete_and_rebuild_candidate_region(
     region_data = select_region_data(mesh, selected_edge_ids)
     region_data_diagnostics = dict(getattr(region_data, "diagnostics", {}) or {})
 
-    initial_face_ids = _normalize_face_ids(
-        region_face_ids if region_face_ids is not None else getattr(region_data, "face_ids", ()),
-        face_count=len(source_faces),
-    )
+    if region_face_ids is None:
+        raise ValueError(
+            "Bore rebuild requires explicit CandidateData rebuild_face_ids. "
+            "RegionData.face_ids are neutral AOI evidence and cannot be used as rebuild input."
+        )
+    initial_face_ids = _normalize_face_ids(region_face_ids, face_count=len(source_faces))
     if not initial_face_ids:
-        raise ValueError("No Bore feature faces were provided or detected for rebuild.")
+        raise ValueError("No CandidateData rebuild_face_ids were provided for rebuild.")
 
     axis = _unit_vector(getattr(region_data, "axis", (0.0, 0.0, 1.0)))
     radius = _safe_float(getattr(region_data, "radius", 0.0), 0.0)
     protected_loop_pair = _protected_loop_pair_from_selection(vertices=vertices, region_data=region_data, axis=axis)
 
+    # POCKET v99: keep the meaning transform explicit.  A POCKET candidate is
+    # not a BORE sleeve candidate.  Recognition has already created a POCKET
+    # hypothesis and owned floor/side-wall roles.  Rebuild Target may therefore
+    # request a pocket-native recessed cup rebuild: delete owned floor + owned
+    # side wall, regenerate side wall + floor, keep the top opening open, and
+    # exclude transition/chamfer evidence.  Only an explicit cap/flatten action
+    # enters the old top-cap path.
+    if _candidate_requests_pocket_cap_rebuild(context=context, candidate_metadata=candidate_metadata):
+        return _delete_pocket_and_fill_opening_cap(
+            mesh=mesh,
+            vertices=vertices,
+            source_faces=source_faces,
+            face_ids=initial_face_ids,
+            selected_edge_ids=selected_edge_ids,
+            candidate_metadata=candidate_metadata,
+            context=context,
+            axis=axis,
+            radius=radius,
+            color_rebuilt_faces=bool(color_rebuilt_faces),
+            base_face_color=base_face_color,
+            rebuilt_face_color=rebuilt_face_color,
+        )
+    if _candidate_requests_pocket_recess_cup_rebuild(context=context, candidate_metadata=candidate_metadata):
+        return _delete_and_rebuild_pocket_recess_cup(
+            mesh=mesh,
+            vertices=vertices,
+            source_faces=source_faces,
+            face_ids=initial_face_ids,
+            selected_edge_ids=selected_edge_ids,
+            candidate_metadata=candidate_metadata,
+            context=context,
+            axis=axis,
+            radius=radius,
+            color_rebuilt_faces=bool(color_rebuilt_faces),
+            base_face_color=base_face_color,
+            rebuilt_face_color=rebuilt_face_color,
+        )
+
     extra_candidate_face_sets: list[tuple[str, tuple[int, ...]]] = []
-    # Use RegionData only as local target-construction context when it
-    # is not the same patch.  The final delete patch still has to validate as
-    # watertight after measured-loop replacement.
+    # v33 semantic boundary: RegionData remains neutral AOI/anchor evidence for
+    # loop protection and measurement only.  It is not offered as a candidate
+    # face pool to rebuild_target.py.
     region_data_face_ids = _normalize_face_ids(getattr(region_data, "face_ids", ()), face_count=len(source_faces))
-    if region_data_face_ids and set(region_data_face_ids) != set(initial_face_ids):
-        extra_candidate_face_sets.append(("region_data_face_pool", region_data_face_ids))
+
+    # v1.6.4 damaged-BORE correction: once Recognition has emitted accepted
+    # two-opening BoreWallOwnership, RebuildTarget may use the measured
+    # two-opening frame as bounded target evidence.  This is not a RegionData
+    # fallback: the candidate frame constrains the target, RegionData only
+    # supplies the local search pool.  It fixes damaged bores where the selected
+    # owned wall fragment is only a half-depth surviving strip and therefore
+    # has no usable boundary-loop pair by itself.
+    candidate_frame = _two_opening_frame_from_candidate_metadata(candidate_metadata)
+    if candidate_frame is not None:
+        axis = _unit_vector(candidate_frame.get("axis", axis), fallback=axis)
+        candidate_protected = _protected_loop_pair_from_candidate_frame(
+            vertices=vertices,
+            source_faces=source_faces,
+            frame=candidate_frame,
+            preferred_pool=region_data_face_ids or initial_face_ids,
+        )
+        if candidate_protected is not None:
+            protected_loop_pair = candidate_protected
+
+    if bool(context.damaged_bore_rebuild_trial) and candidate_frame is not None:
+        frame_target_faces, frame_target_diag = _full_depth_bore_wall_target_faces_from_candidate_frame(
+            vertices=vertices,
+            source_faces=source_faces,
+            frame=candidate_frame,
+            face_pool=region_data_face_ids or tuple(range(len(source_faces))),
+            base_face_ids=initial_face_ids,
+        )
+        if frame_target_faces and len(frame_target_faces) > len(initial_face_ids):
+            extra_candidate_face_sets.append(("candidate_two_opening_frame_full_depth_wall_target", frame_target_faces))
+            region_data_diagnostics.update({f"candidate_frame_full_depth_target_{key}": value for key, value in frame_target_diag.items()})
 
     # Stage 3 — ask rebuild_target for bounded delete-patch proposals.  The
     # proposals are not accepted here; each proposal must still survive a full
@@ -269,7 +339,7 @@ def delete_and_rebuild_candidate_region(
         protected_loop_pair=protected_loop_pair,
         extra_candidate_face_sets=tuple(extra_candidate_face_sets),
         preview_candidate_patch_owns_delete=bool(context.candidate_has_preview_face_patch),
-        topology_seal_callback=topology_seal_callback,
+        topology_seal_callback=None,
         protected_fragment_bridge_callback=None,
     )
     if not bool(target_result.get("valid", False)):
@@ -291,24 +361,22 @@ def delete_and_rebuild_candidate_region(
     # boundaries between the two protected rims.  This is still rebuild-target
     # policy: Region Select does not classify anything, and Rebuild still has to
     # pass watertight trial validation before geometry can change.
-    damaged_bore_targets = _damaged_bore_defect_swallow_targets(
-        vertices=vertices,
-        source_faces=source_faces,
-        target_patches=target_patches,
-        axis=axis,
-        protected_loop_pair=protected_loop_pair,
-        entity_type=context.entity_type,
-    )
-    if damaged_bore_targets:
-        existing_keys = {frozenset(target.face_ids) for target in target_patches}
-        merged_targets: list[RebuildTargetPatch] = []
-        for target in damaged_bore_targets:
-            key = frozenset(target.face_ids)
-            if key in existing_keys:
-                continue
-            existing_keys.add(key)
-            merged_targets.append(target)
-        target_patches = tuple(merged_targets) + target_patches
+    # v50 semantic boundary: damaged-bore defect handling is now allowed only
+    # when Recognition produced a damaged BORE CandidateData row with explicit
+    # rebuild_face_ids.  This is still Target/Rebuild policy, not RegionData
+    # fallback: the base delete patch remains the candidate-owned bore wall.
+    damaged_bore_targets: tuple[RebuildTargetPatch, ...] = ()
+    if bool(context.damaged_bore_rebuild_trial):
+        damaged_bore_targets = _damaged_bore_defect_swallow_targets(
+            vertices=vertices,
+            source_faces=source_faces,
+            target_patches=target_patches,
+            axis=axis,
+            protected_loop_pair=protected_loop_pair,
+            entity_type=context.entity_type,
+        )
+        if damaged_bore_targets:
+            target_patches = tuple(target_patches) + tuple(damaged_bore_targets)
 
     # Stage 4 — derive loop-pair attempts from the exact patch boundaries.
     # Protected loops from the selected RegionData are allowed as fallback attempts, but
@@ -389,11 +457,70 @@ def delete_and_rebuild_candidate_region(
                 generated_vertices=plan.generated_vertices,
                 triangles=plan.triangles,
             )
+            if bool(context.damaged_bore_rebuild_trial) and 0 < int(trial.get("boundary_edge_count_after", 0) or 0) <= 24:
+                # v51 damaged-bore target seal: the v50 trial proved that the
+                # damaged wall candidate can leave a small residual boundary
+                # after the normal two-rim measured replacement.  The observed
+                # failure had 10 remaining boundary edges, so the previous
+                # 6-edge residual loop cap was too strict and only produced a
+                # huge rejection diagnostic.  This remains guarded by the
+                # damaged_bore_rebuild_trial flag and the final watertight trial.
+                seal_triangles, seal_diag = _small_boundary_seal_triangles_for_trial_mesh(
+                    source_faces=source_faces,
+                    face_ids=attempt.face_ids,
+                    generated_vertices=plan.generated_vertices,
+                    triangles=plan.triangles,
+                    max_boundary_edges=24,
+                    max_loop_edges=16,
+                )
+                plan_diag_with_seal = dict(plan.diagnostics)
+                plan_diag_with_seal.update({f"damaged_bore_small_boundary_seal_{key}": value for key, value in dict(seal_diag).items()})
+                plan_diag_with_seal["damaged_bore_small_boundary_seal_considered"] = True
+                if len(seal_triangles):
+                    sealed_triangles = np.vstack([np.asarray(plan.triangles, dtype=np.int64).reshape((-1, 3)), seal_triangles])
+                    sealed_trial = _trial_rebuild(
+                        vertices=vertices,
+                        source_faces=source_faces,
+                        face_ids=attempt.face_ids,
+                        generated_vertices=plan.generated_vertices,
+                        triangles=sealed_triangles,
+                    )
+                    plan_diag_with_seal["damaged_bore_small_boundary_seal_trial_boundary_edge_count_after"] = int(sealed_trial.get("boundary_edge_count_after", -1))
+                    plan_diag_with_seal["damaged_bore_small_boundary_seal_trial_watertight_after"] = bool(sealed_trial.get("watertight_after", False))
+                    if int(sealed_trial.get("boundary_edge_count_after", 10**9)) <= int(trial.get("boundary_edge_count_after", 10**9)):
+                        plan_diag_with_seal["damaged_bore_small_boundary_seal_used"] = True
+                        plan_diag_with_seal["damaged_bore_small_boundary_seal_added_triangle_count"] = int(len(seal_triangles))
+                        plan = QuadPlan(
+                            generated_vertices=plan.generated_vertices,
+                            triangles=sealed_triangles,
+                            logical_quads=plan.logical_quads,
+                            loop0=plan.loop0,
+                            loop1=plan.loop1,
+                            center0=plan.center0,
+                            center1=plan.center1,
+                            axis=plan.axis,
+                            diagnostics=plan_diag_with_seal,
+                        )
+                        trial = sealed_trial
+                else:
+                    # Keep the rejection reason visible in the attempt summary so
+                    # future damaged-bore target work has concrete evidence.
+                    plan = QuadPlan(
+                        generated_vertices=plan.generated_vertices,
+                        triangles=plan.triangles,
+                        logical_quads=plan.logical_quads,
+                        loop0=plan.loop0,
+                        loop1=plan.loop1,
+                        center0=plan.center0,
+                        center1=plan.center1,
+                        axis=plan.axis,
+                        diagnostics=plan_diag_with_seal,
+                    )
             summary = _attempt_summary(attempt_index, attempt, trial=trial, plan=plan)
             attempt_summaries.append(summary)
             if not best_failure or int(summary.get("boundary_edge_count_after", 10**9)) < int(best_failure.get("boundary_edge_count_after", 10**9)):
                 best_failure = dict(summary)
-            if int(trial.get("boundary_edge_count_after", -1)) == 0 and bool(trial.get("watertight_after", False)):
+            if _trial_accepts_for_context(context=context, trial=trial, plan=plan):
                 selected = (attempt, plan, trial)
                 break
         except Exception as exc:
@@ -493,12 +620,26 @@ def delete_and_rebuild_candidate_region(
         "generated_triangle_normal_flip_count": int(selected_plan.diagnostics.get("normal_flip_count", 0) or 0),
         "generated_triangle_normal_alignment_median": float(selected_plan.diagnostics.get("normal_alignment_median", 0.0) or 0.0),
         "generated_triangle_normal_alignment_min": float(selected_plan.diagnostics.get("normal_alignment_min", 0.0) or 0.0),
+        "boundary_edge_count_before": int(selected_trial.get("boundary_edge_count_before", -1)),
         "boundary_edge_count_after": int(selected_trial.get("boundary_edge_count_after", -1)),
+        "boundary_edge_count_delta": int(selected_trial.get("boundary_edge_count_delta", 0)),
         "watertight_after": bool(selected_trial.get("watertight_after", False)),
+        "local_topology_acceptance_used": bool(not bool(selected_trial.get("watertight_after", False)) and _trial_accepts_for_context(context=context, trial=selected_trial, plan=selected_plan)),
+        "local_bore_wall_rebuild_acceptance_v85": bool(str(context.entity_type).strip().lower() == "borehole" and not bool(selected_trial.get("watertight_after", False)) and _trial_accepts_for_context(context=context, trial=selected_trial, plan=selected_plan)),
+        "local_pocket_sidewall_rebuild_acceptance_v98": bool(str(context.entity_type).strip().lower() in {"pocket", "circular_pocket"} and not bool(selected_trial.get("watertight_after", False)) and _trial_accepts_for_context(context=context, trial=selected_trial, plan=selected_plan)),
+        "local_pocket_sidewall_rebuild_acceptance_v97": bool(str(context.entity_type).strip().lower() in {"pocket", "circular_pocket"} and not bool(selected_trial.get("watertight_after", False)) and _trial_accepts_for_context(context=context, trial=selected_trial, plan=selected_plan)),
+        "pocket_local_boundary_exact_acceptance_contract_v98": "owned_side_wall_preserve_recess_delete_patch_boundary_match_exact_no_new_boundary_edges_no_global_boundary_increase_zero_counts_preserved",
+        "pocket_local_boundary_exact_acceptance_contract_v97": "owned_side_wall_preserve_recess_delete_patch_boundary_match_exact_no_new_boundary_edges_no_global_boundary_increase",
+        "zero_boundary_trial_acceptance_v85": bool(int(selected_trial.get("boundary_edge_count_after", -1) if selected_trial.get("boundary_edge_count_after", -1) is not None else -1) == 0 and bool(selected_trial.get("watertight_after", False))),
+        "damaged_bore_internal_defect_boundaries_swallowed_v85": bool(str(context.entity_type).strip().lower() == "borehole" and int(selected_trial.get("boundary_edge_count_after", -1) if selected_trial.get("boundary_edge_count_after", -1) is not None else -1) == 0 and bool(selected_trial.get("watertight_after", False))),
         "quad_density_mode": context.quad_density_mode,
         "quad_plan": dict(selected_plan.diagnostics),
         "rebuild_target_diagnostics": dict(target_result.get("diagnostics", {}) or {}),
         "region_data_diagnostics": region_data_diagnostics,
+        "v33_semantic_boundary_hardening_used": True,
+        "region_data_as_rebuild_input_enabled": False,
+        "topology_seal_callback_enabled": False,
+        "damaged_bore_defect_swallow_targets_enabled": False,
         "parameter_fit_used": False,
         "radius_used_for_delete_expansion": False,
         "axis_used_for_delete_expansion": False,
@@ -522,6 +663,1293 @@ def delete_and_rebuild_candidate_region(
     )
 
 
+
+# -----------------------------------------------------------------------------
+# POCKET v99: recessed cup delete/rebuild
+# -----------------------------------------------------------------------------
+
+
+def _candidate_requests_pocket_recess_cup_rebuild(*, context: RebuildCandidateContext, candidate_metadata: Mapping[str, object]) -> bool:
+    """Return True for the pocket-native floor+side-wall recessed cup rebuild.
+
+    This is the clean POCKET operation path.  It is intentionally separate from
+    the generic measured two-loop Bore wall retessellator and from the cap/flat
+    pocket-removal path.  A candidate enters this path only after Recognition has
+    emitted accepted POCKET CandidateData with owned floor and side-wall roles.
+    """
+
+    entity = str(getattr(context, "entity_type", "") or "").strip().lower()
+    family = str(candidate_metadata.get("feature_family", "") or "").strip().lower()
+    action = str(candidate_metadata.get("candidate_action", "") or "").strip().lower()
+    gate = str(getattr(context, "rebuild_gate", "") or "").strip().lower()
+    scope = str(candidate_metadata.get("pocket_rebuild_enable_scope", "") or "").strip().lower()
+    if not (entity in {"pocket", "circular_pocket"} or family in {"pocket", "circular_pocket"}):
+        return False
+    if "cap" in action or "cap" in gate or "cap" in scope or "flatten" in action or "flatten" in scope:
+        return False
+    side_ids = tuple_ints(candidate_metadata.get("pocket_side_wall_face_ids", ()))
+    floor_ids = tuple_ints(candidate_metadata.get("pocket_floor_face_ids", ()))
+    return bool(
+        side_ids
+        and floor_ids
+        and (
+            "recess" in action
+            or "recess" in gate
+            or "recess" in scope
+            or "cup" in action
+            or "cup" in gate
+            or "cup" in scope
+            or "owned_floor" in scope
+            or "floor" in action
+        )
+    )
+
+
+def _delete_and_rebuild_pocket_recess_cup(
+    *,
+    mesh: trimesh.Trimesh,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    face_ids: tuple[int, ...],
+    selected_edge_ids: tuple[int, ...],
+    candidate_metadata: Mapping[str, object],
+    context: RebuildCandidateContext,
+    axis: np.ndarray,
+    radius: float,
+    color_rebuilt_faces: bool,
+    base_face_color: RGBA,
+    rebuilt_face_color: RGBA,
+) -> RebuildResult:
+    """Delete owned pocket floor + side wall and rebuild the recessed cup.
+
+    Semantic contract:
+        accepted POCKET CandidateData
+            -> owned pocket side-wall faces + owned pocket floor faces
+            -> pocket recess-cup DeletePatchProposal
+            -> generated side-wall surface + generated floor surface
+            -> local topology validation
+
+    This path is neither a BORE wall sleeve nor a parent-surface cap.  The top
+    opening remains open.  The bottom floor is regenerated at the measured floor
+    boundary.  Transition/chamfer faces stay outside the delete patch unless
+    Recognition explicitly owns them under a later transition role.
+    """
+
+    faces_arr = np.asarray(source_faces, dtype=np.int64)[:, :3]
+    wall_ids = _normalize_face_ids(candidate_metadata.get("pocket_side_wall_face_ids", ()), face_count=len(faces_arr))
+    floor_ids = _normalize_face_ids(candidate_metadata.get("pocket_floor_face_ids", ()), face_count=len(faces_arr))
+    if not wall_ids or not floor_ids:
+        raise ValueError(
+            "POCKET recess-cup rebuild requires explicit owned pocket_side_wall_face_ids and pocket_floor_face_ids. "
+            f"wall_count={len(wall_ids)}; floor_count={len(floor_ids)}; Geometry changed: no."
+        )
+
+    patch_faces = tuple(sorted({int(fid) for fid in tuple(wall_ids + floor_ids) if 0 <= int(fid) < len(faces_arr)}))
+    explicit_request = _normalize_face_ids(face_ids, face_count=len(faces_arr))
+    if explicit_request and not set(patch_faces).issubset(set(explicit_request)):
+        # CandidateView should normally pass exactly the owned floor+wall faces.
+        # Keep the operation safe by refusing a mismatched delete patch instead
+        # of silently expanding from unrelated RegionData.
+        raise ValueError(
+            "POCKET recess-cup rebuild request does not match owned POCKET roles. "
+            f"request_face_count={len(explicit_request)}; owned_floor_plus_wall_count={len(patch_faces)}; Geometry changed: no."
+        )
+
+    floor_boundary_loops = _candidate_patch_boundary_edge_loops(source_faces=faces_arr, face_ids=floor_ids)
+    wall_boundary_loops = _candidate_patch_boundary_edge_loops(source_faces=faces_arr, face_ids=wall_ids)
+    if not floor_boundary_loops:
+        raise ValueError(
+            "POCKET recess-cup rebuild could not derive an owned floor perimeter loop. "
+            f"floor_face_count={len(floor_ids)}; Geometry changed: no."
+        )
+    if len(wall_boundary_loops) < 2:
+        raise ValueError(
+            "POCKET recess-cup rebuild could not derive top and floor wall loops from owned side-wall faces. "
+            f"wall_face_count={len(wall_ids)}; wall_boundary_loop_count={len(wall_boundary_loops)}; Geometry changed: no."
+        )
+
+    def _loop_edge_set(loop_record: Mapping[str, object]) -> set[EdgeKey]:
+        return {_edge_key(edge) for edge in tuple(loop_record.get("edges", ()) or ())}
+
+    def _loop_vertex_set(loop_record: Mapping[str, object]) -> set[int]:
+        return {int(v) for v in tuple(loop_record.get("vertices", ()) or ())}
+
+    def _floor_wall_overlap_score(floor_record: Mapping[str, object]) -> tuple[int, int, int, int]:
+        floor_edges_local = _loop_edge_set(floor_record)
+        floor_vertices_local = _loop_vertex_set(floor_record)
+        best_edge_overlap = 0
+        best_vertex_overlap = 0
+        for wall_record in wall_boundary_loops:
+            wall_edges = _loop_edge_set(wall_record)
+            wall_vertices = _loop_vertex_set(wall_record)
+            best_edge_overlap = max(best_edge_overlap, int(len(floor_edges_local & wall_edges)))
+            best_vertex_overlap = max(best_vertex_overlap, int(len(floor_vertices_local & wall_vertices)))
+        return (best_edge_overlap, best_vertex_overlap, int(len(floor_edges_local)), int(len(floor_vertices_local)))
+
+    # Compound POCKET+BORE rule: if the owned floor has multiple boundary loops,
+    # the loop that overlaps the owned pocket side wall is the floor outer
+    # perimeter.  Other floor loops are protected child-BORE openings.  This is
+    # relationship metadata, not a new feature family and not pocket wall
+    # ownership.
+    floor_loop_record = max(floor_boundary_loops, key=_floor_wall_overlap_score)
+    floor_edges = _loop_edge_set(floor_loop_record)
+    floor_vertices = _loop_vertex_set(floor_loop_record)
+    protected_floor_hole_records = tuple(
+        record for record in floor_boundary_loops
+        if _loop_vertex_set(record) != floor_vertices and len(_loop_vertex_set(record)) >= 3
+    )
+    if len(protected_floor_hole_records) > 1:
+        raise ValueError(
+            "POCKET compound recess-cup rebuild currently supports one protected child-BORE opening per pocket floor. "
+            f"protected_opening_count={len(protected_floor_hole_records)}; Geometry changed: no."
+        )
+
+    def _wall_floor_overlap(loop_record: Mapping[str, object]) -> tuple[int, int, int]:
+        loop_edges = _loop_edge_set(loop_record)
+        loop_vertices = _loop_vertex_set(loop_record)
+        return (int(len(loop_edges & floor_edges)), int(len(loop_vertices & floor_vertices)), int(len(loop_vertices)))
+
+    bottom_record = max(wall_boundary_loops, key=_wall_floor_overlap)
+    bottom_vertices = tuple(int(v) for v in tuple(bottom_record.get("vertices", ()) or ()))
+    bottom_set = set(bottom_vertices)
+    top_candidates = [
+        item for item in wall_boundary_loops
+        if set(int(v) for v in tuple(item.get("vertices", ()) or ())) != bottom_set
+    ]
+    if not top_candidates:
+        raise ValueError(
+            "POCKET recess-cup rebuild could not separate parent opening loop from floor loop. "
+            f"wall_boundary_loop_count={len(wall_boundary_loops)}; Geometry changed: no."
+        )
+    top_record = max(top_candidates, key=lambda item: len(tuple(item.get("vertices", ()) or ())))
+    top_loop = tuple(int(v) for v in tuple(top_record.get("vertices", ()) or ()))
+    bottom_loop = bottom_vertices
+    if len(top_loop) < 3 or len(bottom_loop) < 3:
+        raise ValueError(
+            "POCKET recess-cup rebuild found invalid top/floor loops. "
+            f"top_loop_vertices={len(top_loop)}; bottom_loop_vertices={len(bottom_loop)}; Geometry changed: no."
+        )
+
+    axis_vec = _unit_vector(axis)
+    center_top = _loop_center(vertices, top_loop)
+    center_bottom = _loop_center(vertices, bottom_loop)
+    axial_separation = abs(float(np.dot(center_bottom - center_top, axis_vec)))
+    min_sep = _minimum_loop_pair_separation(vertices, top_loop, bottom_loop)
+    if axial_separation <= min_sep:
+        # Fall back to the center-to-center vector if RegionData axis was not the
+        # useful pocket depth direction.  This remains measurement, not feature
+        # classification.
+        axis_vec = _unit_vector(center_bottom - center_top, fallback=axis_vec)
+        axial_separation = abs(float(np.dot(center_bottom - center_top, axis_vec)))
+    if axial_separation <= min_sep:
+        raise ValueError(
+            "POCKET recess-cup rebuild top/floor loops have no usable depth separation. "
+            f"axial_separation={axial_separation}; min_required={min_sep}; Geometry changed: no."
+        )
+
+    attempt = BoundaryLoopAttempt(
+        source="pocket_recess_cup_wall_loop_pair_v99",
+        target_source="pocket_recess_cup_owned_floor_plus_sidewall_target_v99",
+        face_ids=wall_ids,
+        loop0=top_loop,
+        loop1=bottom_loop,
+        boundary_loop_count=int(len(wall_boundary_loops)),
+        exact_two_loop_patch=bool(len(wall_boundary_loops) == 2),
+        protected_loop_pair=False,
+        axial_separation=float(axial_separation),
+        min_required_axial_separation=float(min_sep),
+        unequal_loop_transition_allowed=bool(len(top_loop) != len(bottom_loop)),
+        boundary_loop_vertex_count_delta=int(abs(len(top_loop) - len(bottom_loop))),
+        loop_summaries=tuple(
+            {
+                "index": int(i),
+                "vertex_count": int(len(tuple(item.get("vertices", ()) or ()))),
+                "floor_overlap_edges": int(_wall_floor_overlap(item)[0]),
+                "floor_overlap_vertices": int(_wall_floor_overlap(item)[1]),
+            }
+            for i, item in enumerate(wall_boundary_loops[:12])
+        ),
+    )
+
+    wall_plan = _quad_plan_for_attempt(
+        vertices=vertices,
+        attempt=attempt,
+        axis=axis_vec,
+        quad_density_mode=context.quad_density_mode,
+    )
+    wall_plan = _orient_plan_triangles_to_source_patch(
+        vertices=vertices,
+        source_faces=faces_arr,
+        face_ids=wall_ids,
+        plan=wall_plan,
+    )
+
+    # Use the loop ordering after measured-loop alignment.  The floor cap must
+    # share exactly the same bottom loop used by the rebuilt side-wall surface.
+    plan_loop0_set = set(int(v) for v in tuple(wall_plan.loop0 or ()))
+    plan_loop1_set = set(int(v) for v in tuple(wall_plan.loop1 or ()))
+    floor_ref_set = set(int(v) for v in tuple(bottom_loop or ()))
+    if len(plan_loop0_set & floor_ref_set) >= len(plan_loop1_set & floor_ref_set):
+        cap_loop = tuple(int(v) for v in tuple(wall_plan.loop0 or ()))
+    else:
+        cap_loop = tuple(int(v) for v in tuple(wall_plan.loop1 or ()))
+
+    if protected_floor_hole_records:
+        protected_loop = tuple(int(v) for v in tuple(protected_floor_hole_records[0].get("vertices", ()) or ()))
+        floor_generated_vertices, floor_triangles, floor_logical_quads, floor_diag = _pocket_floor_annular_quad_grid_from_loops(
+            vertices=vertices,
+            outer_loop_vertices=cap_loop,
+            inner_loop_vertices=protected_loop,
+            generated_vertex_offset=int(len(wall_plan.generated_vertices)),
+            floor_axis=np.asarray(wall_plan.axis, dtype=float).reshape(3),
+            quad_density_mode=context.quad_density_mode,
+        )
+    else:
+        floor_generated_vertices, floor_triangles, floor_logical_quads, floor_diag = _pocket_floor_quad_grid_from_loop(
+            vertices=vertices,
+            loop_vertices=cap_loop,
+            generated_vertex_offset=int(len(wall_plan.generated_vertices)),
+            quad_density_mode=context.quad_density_mode,
+        )
+    floor_triangles = _orient_triangles_to_source_role_normal(
+        vertices=vertices,
+        generated_vertices=np.vstack([
+            np.asarray(wall_plan.generated_vertices, dtype=float).reshape((-1, 3)),
+            floor_generated_vertices,
+        ]).reshape((-1, 3)),
+        triangles=floor_triangles,
+        source_faces=faces_arr,
+        face_ids=floor_ids,
+        fallback_normal=np.asarray(wall_plan.axis, dtype=float).reshape(3),
+    )
+    wall_plan = _orient_pocket_wall_triangles_by_radial_role(
+        vertices=vertices,
+        source_faces=faces_arr,
+        face_ids=wall_ids,
+        plan=wall_plan,
+    )
+
+    generated_vertices = np.vstack([
+        np.asarray(wall_plan.generated_vertices, dtype=float).reshape((-1, 3)),
+        floor_generated_vertices,
+    ]).reshape((-1, 3))
+    triangles = np.vstack([
+        np.asarray(wall_plan.triangles, dtype=np.int64).reshape((-1, 3)),
+        floor_triangles,
+    ]).reshape((-1, 3))
+
+    combined_plan = QuadPlan(
+        generated_vertices=generated_vertices,
+        triangles=triangles,
+        logical_quads=tuple(wall_plan.logical_quads) + tuple(floor_logical_quads),
+        loop0=tuple(int(v) for v in tuple(wall_plan.loop0 or ())),
+        loop1=tuple(int(v) for v in tuple(wall_plan.loop1 or ())),
+        center0=np.asarray(wall_plan.center0, dtype=float).reshape(3),
+        center1=np.asarray(wall_plan.center1, dtype=float).reshape(3),
+        axis=np.asarray(wall_plan.axis, dtype=float).reshape(3),
+        diagnostics={
+            **dict(wall_plan.diagnostics),
+            **dict(floor_diag),
+            "plan_type": "pocket_recess_cup_rebuild_plan_v100_quad_floor",
+            "geometry_source": "owned_pocket_wall_loops_plus_owned_floor_perimeter",
+            "semantic_rebuild_contract": "POCKET CandidateData -> owned floor+side-wall DeletePatchProposal -> side-wall plus quad-floor generated cup",
+            "pocket_rebuild_operation": "restore_recess_cup",
+            "pocket_delete_patch_meaning": "owned_pocket_floor_plus_owned_pocket_side_wall",
+            "pocket_top_opening_policy": "preserve_opening_not_parent_surface_cap",
+            "pocket_transition_policy": "transition_faces_excluded_unless_separately_owned",
+            "pocket_side_wall_face_count": int(len(wall_ids)),
+            "pocket_floor_face_count": int(len(floor_ids)),
+            "pocket_delete_face_count": int(len(patch_faces)),
+            "pocket_floor_cap_loop_vertex_count": int(len(cap_loop)),
+            "pocket_floor_cap_added_triangle_count": int(len(floor_triangles)),
+            "pocket_floor_cap_generated_center_vertex_count": 0,
+            "pocket_floor_added_triangle_count": int(len(floor_triangles)),
+            "pocket_floor_logical_quad_count": int(len(floor_logical_quads)),
+            "pocket_floor_fill_kind": str(floor_diag.get("pocket_floor_fill_kind", "quad_grid")),
+            "pocket_floor_protected_child_bore_opening_count": int(len(protected_floor_hole_records)),
+            "pocket_floor_protected_child_bore_loop_vertex_counts": tuple(int(len(tuple(record.get("vertices", ()) or ()))) for record in protected_floor_hole_records),
+            "compound_pocket_bore_semantics": "POCKET rebuild protects child BORE floor opening as relationship metadata; BORE remains separate candidate",
+            "pocket_wall_added_triangle_count": int(len(wall_plan.triangles)),
+            "pocket_wall_logical_quad_count": int(len(wall_plan.logical_quads)),
+        },
+    )
+    boundary_match = _generated_surface_boundary_match_diagnostics(
+        source_faces=faces_arr,
+        face_ids=patch_faces,
+        triangles=combined_plan.triangles,
+        source_vertex_count=int(len(vertices)),
+    )
+    combined_plan = QuadPlan(
+        generated_vertices=combined_plan.generated_vertices,
+        triangles=combined_plan.triangles,
+        logical_quads=combined_plan.logical_quads,
+        loop0=combined_plan.loop0,
+        loop1=combined_plan.loop1,
+        center0=combined_plan.center0,
+        center1=combined_plan.center1,
+        axis=combined_plan.axis,
+        diagnostics={**dict(combined_plan.diagnostics), **boundary_match},
+    )
+
+    trial = _trial_rebuild(
+        vertices=vertices,
+        source_faces=faces_arr,
+        face_ids=patch_faces,
+        generated_vertices=combined_plan.generated_vertices,
+        triangles=combined_plan.triangles,
+    )
+    local_accept = _pocket_recess_cup_trial_accepts(trial=trial, plan=combined_plan)
+    if not bool(trial.get("watertight_after", False)) and not local_accept:
+        raise ValueError(
+            "POCKET recess-cup rebuild local validation failed. "
+            f"delete_faces={len(patch_faces)}; wall_faces={len(wall_ids)}; floor_faces={len(floor_ids)}; "
+            f"boundary_match_exact={combined_plan.diagnostics.get('boundary_match_exact', False)}; "
+            f"missing={combined_plan.diagnostics.get('missing_patch_boundary_edge_count', '-')}; "
+            f"extra={combined_plan.diagnostics.get('extra_generated_boundary_edge_count', '-')}; "
+            f"generated_new_boundary={combined_plan.diagnostics.get('generated_boundary_generated_vertex_edge_count', '-')}; "
+            f"boundary_before={trial.get('boundary_edge_count_before', '-')}; boundary_after={trial.get('boundary_edge_count_after', '-')}; "
+            "Geometry changed: no."
+        )
+
+    result = _apply_rebuild(
+        mesh=mesh,
+        vertices=vertices,
+        source_faces=faces_arr,
+        face_ids=patch_faces,
+        generated_vertices=combined_plan.generated_vertices,
+        triangles=combined_plan.triangles,
+        color_rebuilt_faces=bool(color_rebuilt_faces),
+        base_face_color=base_face_color,
+        rebuilt_face_color=rebuilt_face_color,
+    )
+    before_face_count = int(len(faces_arr))
+    result_mesh = result["mesh"]
+    after_face_count = int(len(getattr(result_mesh, "faces", ())))
+    diagnostics = {
+        "mode": "pocket_recess_cup_rebuild_v100_quad_floor",
+        "topology_policy": "owned_pocket_floor_plus_sidewall_recess_cup_quad_floor_local_validation_v100",
+        "pipeline": (
+            "accepted_pocket_candidate_data",
+            "owned_floor_plus_sidewall_target",
+            "sidewall_loop_pair_from_wall_ownership",
+            "floor_perimeter_from_floor_ownership",
+            "generate_sidewall",
+            "generate_floor",
+            "local_topology_validation",
+            "apply_rebuild",
+        ),
+        "candidate_entity_type": context.entity_type or "pocket",
+        "candidate_rebuild_gate": context.rebuild_gate,
+        "candidate_role": context.role,
+        "candidate_from_component_engine": bool(context.candidate_from_component_engine),
+        "candidate_feature_ownership_source": context.feature_ownership_source,
+        "selected_edge_count": int(len(selected_edge_ids)),
+        "initial_face_count": int(len(face_ids)),
+        "before_face_count": int(before_face_count),
+        "after_face_count": int(after_face_count),
+        "before_vertex_count": int(len(vertices)),
+        "after_vertex_count": int(len(getattr(result_mesh, "vertices", ()))),
+        "removed_face_count": int(len(patch_faces)),
+        "pocket_removed_side_wall_face_count": int(len(wall_ids)),
+        "pocket_removed_floor_face_count": int(len(floor_ids)),
+        "pocket_rebuild_operation": "restore_recess_cup",
+        "pocket_rebuild_semantic_contract_v102": "POCKET hypothesis owns floor+side-wall roles; child BORE opening is protected relationship metadata; target rebuilds a recessed cup with solid or annular quad floor",
+        "pocket_rebuild_semantic_contract_v100": "POCKET hypothesis owns floor+side-wall roles; target deletes those roles and rebuilds a recessed cup with a quad floor, not a bore sleeve, not a fan floor, and not a flush cap",
+        "pocket_floor_role_rebuilt": True,
+        "pocket_side_wall_role_rebuilt": True,
+        "pocket_top_opening_preserved": True,
+        "pocket_transition_faces_excluded": True,
+        "quad_density_mode": context.quad_density_mode,
+        "logical_quad_count": int(len(combined_plan.logical_quads)),
+        "added_logical_quad_count": int(len(combined_plan.logical_quads)),
+        "added_triangle_count": int(len(combined_plan.triangles)),
+        "added_runtime_triangle_count": int(len(combined_plan.triangles)),
+        "actual_added_face_count": int(len(combined_plan.triangles)),
+        "added_face_count": int(len(combined_plan.triangles)),
+        "colored_rebuilt_face_count": int(len(result["added_face_ids"])),
+        "generated_vertex_count": int(len(combined_plan.generated_vertices)),
+        "loop0_vertex_count": int(len(combined_plan.loop0)),
+        "loop1_vertex_count": int(len(combined_plan.loop1)),
+        "boundary_loop_vertex_count_delta": int(abs(len(combined_plan.loop0) - len(combined_plan.loop1))),
+        "pocket_floor_cap_loop_vertex_count": int(len(cap_loop)),
+        "pocket_floor_cap_added_triangle_count": int(len(floor_triangles)),
+        "pocket_floor_added_triangle_count": int(len(floor_triangles)),
+        "pocket_floor_logical_quad_count": int(len(floor_logical_quads)),
+        "pocket_floor_fill_kind": str(floor_diag.get("pocket_floor_fill_kind", "quad_grid")),
+        "pocket_floor_protected_child_bore_opening_count": int(len(protected_floor_hole_records)),
+        "pocket_floor_protected_child_bore_loop_vertex_counts": tuple(int(len(tuple(record.get("vertices", ()) or ()))) for record in protected_floor_hole_records),
+        "compound_pocket_bore_semantics": "POCKET rebuild protects child BORE floor opening as relationship metadata; BORE remains separate candidate",
+        "pocket_wall_added_triangle_count": int(len(wall_plan.triangles)),
+        "boundary_edge_count_before": int(trial.get("boundary_edge_count_before", -1)),
+        "boundary_edge_count_after": int(trial.get("boundary_edge_count_after", -1)),
+        "boundary_edge_count_delta": int(trial.get("boundary_edge_count_delta", 0)),
+        "watertight_after": bool(trial.get("watertight_after", False)),
+        "local_topology_acceptance_used": bool(local_accept and not bool(trial.get("watertight_after", False))),
+        "local_pocket_recess_cup_acceptance_v99": bool(local_accept),
+        "quad_plan": dict(combined_plan.diagnostics),
+        "parameter_fit_used": False,
+        "radius_used_for_delete_expansion": False,
+        "axis_used_for_delete_expansion": False,
+        "radius_used_for_vertex_placement": False,
+        "axis_used_for_vertex_placement": False,
+        "existing_boundary_vertices_moved": 0,
+        **{str(k): v for k, v in boundary_match.items()},
+    }
+    return RebuildResult(
+        mesh=result["mesh"],
+        removed_face_ids=patch_faces,
+        added_face_ids=result["added_face_ids"],
+        added_faces=tuple(tuple(int(v) for v in tri) for tri in combined_plan.triangles.tolist()),
+        loop0_vertices=combined_plan.loop0,
+        loop1_vertices=combined_plan.loop1,
+        axis=_to_vector3(combined_plan.axis),
+        radius=float(radius),
+        diagnostics=diagnostics,
+    )
+
+
+def _pocket_floor_annular_quad_grid_from_loops(
+    *,
+    vertices: np.ndarray,
+    outer_loop_vertices: tuple[int, ...],
+    inner_loop_vertices: tuple[int, ...],
+    generated_vertex_offset: int,
+    floor_axis: np.ndarray,
+    quad_density_mode: str,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, int, int, int], ...], dict[str, object]]:
+    """Return an adaptive annular floor grid for a POCKET with a child BORE.
+
+    v104 semantic contract:
+        POCKET remains the parent feature family.
+        BORE remains a separate child feature candidate.
+        The floor hole is relationship/protected-boundary metadata.
+        Rebuild must sew to the locked outer pocket-floor boundary and the
+        locked inner child-BORE opening without changing either boundary.
+
+    This replaces the v103 "fail on odd count delta" policy.  Pure all-quad
+    bands are used whenever the loop counts allow them.  When the two locked
+    boundaries cannot be connected by a pure all-quad annulus without splitting
+    existing boundary edges, the generator creates adaptive sew collars at the
+    locked boundary side(s), while keeping the interior floor as a regular
+    density-controlled quad grid.  The fallback collar is local, explicit, and
+    diagnostic; it does not close the child BORE and does not invent a new
+    feature family.
+    """
+
+    outer = tuple(int(v) for v in tuple(outer_loop_vertices or ()) if 0 <= int(v) < len(vertices))
+    inner = tuple(int(v) for v in tuple(inner_loop_vertices or ()) if 0 <= int(v) < len(vertices))
+    if len(outer) < 4 or len(inner) < 4:
+        raise ValueError(
+            "POCKET annular floor rebuild requires valid outer and protected inner loops with at least four vertices. "
+            f"outer={len(outer)}; inner={len(inner)}; Geometry changed: no."
+        )
+
+    axis_vec = _unit_vector(floor_axis)
+    outer_center = _loop_center(vertices, outer)
+    inner_center = _loop_center(vertices, inner)
+    sorted_outer, sorted_inner = _sort_loop_pair_by_angle(vertices, outer, inner, outer_center, inner_center, axis_vec)
+
+    # Align loops by angular phase.  Equal loops can use the exact measured loop
+    # alignment.  Unequal loops use angle-sample alignment only; this is still
+    # relationship/geometry evidence, not feature-family creation.
+    if len(sorted_outer) == len(sorted_inner):
+        sorted_inner = _align_second_loop_to_first(
+            vertices,
+            tuple(int(v) for v in sorted_outer),
+            tuple(int(v) for v in sorted_inner),
+            outer_center,
+            inner_center,
+            axis_vec,
+        )
+        alignment_diag: dict[str, object] = {
+            "annular_floor_equal_loop_used": True,
+            "annular_floor_unequal_loop_used": False,
+            "annular_floor_alignment_source": "equal_loop_cyclic_alignment",
+        }
+    else:
+        aligned_outer, aligned_inner, alignment_diag_raw = _align_unequal_loop_pair_to_angle_samples(
+            vertices=vertices,
+            loop0=tuple(int(v) for v in sorted_outer),
+            loop1=tuple(int(v) for v in sorted_inner),
+            center0=outer_center,
+            center1=inner_center,
+            axis=axis_vec,
+        )
+        sorted_outer = tuple(int(v) for v in aligned_outer)
+        sorted_inner = tuple(int(v) for v in aligned_inner)
+        alignment_diag = {
+            **dict(alignment_diag_raw),
+            "annular_floor_equal_loop_used": False,
+            "annular_floor_unequal_loop_used": True,
+            "annular_floor_alignment_source": "unequal_loop_angle_sample_alignment",
+        }
+
+    outer_pts = vertices[np.asarray(sorted_outer, dtype=np.int64), :3]
+    inner_pts = vertices[np.asarray(sorted_inner, dtype=np.int64), :3]
+    n_outer = int(len(sorted_outer))
+    n_inner = int(len(sorted_inner))
+
+    sample_count = max(int(n_outer), int(n_inner), 8)
+    outer_sample = _sample_closed_loop_points(outer_pts, sample_count)
+    inner_sample = _sample_closed_loop_points(inner_pts, sample_count)
+    radial_gaps = np.linalg.norm(outer_sample - inner_sample, axis=1)
+    radial_gaps = radial_gaps[np.isfinite(radial_gaps) & (radial_gaps > 1.0e-12)]
+    radial_span = float(np.median(radial_gaps)) if radial_gaps.size else float(np.linalg.norm(outer_center - inner_center))
+    outer_edges = np.linalg.norm(np.roll(outer_pts, -1, axis=0) - outer_pts, axis=1)
+    inner_edges = np.linalg.norm(np.roll(inner_pts, -1, axis=0) - inner_pts, axis=1)
+    edge_lengths = np.concatenate([outer_edges, inner_edges])
+    edge_lengths = edge_lengths[np.isfinite(edge_lengths) & (edge_lengths > 1.0e-12)]
+    measured_edge = float(np.median(edge_lengths)) if edge_lengths.size else 1.0
+    measured_edge = max(float(measured_edge), 1.0e-12)
+
+    mode_norm = _normalize_quad_density_mode(quad_density_mode)
+    if mode_norm == QUAD_DENSITY_MODE_FULL:
+        pitch = measured_edge
+        cap = 128
+    elif mode_norm == QUAD_DENSITY_MODE_PI:
+        pitch = max(2.5 * measured_edge, radial_span / 32.0 if radial_span > 1.0e-12 else measured_edge)
+        cap = 64
+    else:
+        pitch = max(4.0 * measured_edge, radial_span / 24.0 if radial_span > 1.0e-12 else measured_edge)
+        cap = 48
+    raw_radial_bands = int(math.ceil(radial_span / max(pitch, 1.0e-12))) if np.isfinite(radial_span) and radial_span > 1.0e-12 else 1
+
+    # Adaptive sew-collar strategy:
+    #   locked outer loop -> optional generated common-count grid rings -> locked inner loop
+    # The interior rings all use a common count so the floor center area remains
+    # an orderly quad grid.  Only the boundary collars adapt to mismatched
+    # source geometry.  This avoids failing when loop counts do not meet the
+    # strict pure-quad parity rule, while still preserving both locked loops.
+    common_count = int(max(n_outer, n_inner, 4))
+    count_delta = abs(int(n_outer) - int(n_inner))
+    needs_adaptive_collar = bool(count_delta % 2 or count_delta != 0)
+    target_band_count = max(1, min(int(cap), int(raw_radial_bands)))
+    if needs_adaptive_collar:
+        target_band_count = max(2, target_band_count)
+
+    generated_blocks: list[np.ndarray] = []
+    ring_ids: list[tuple[int, ...]] = [tuple(int(v) for v in sorted_outer)]
+    next_generated_id = int(len(vertices) + int(generated_vertex_offset))
+    for ring_index in range(1, int(target_band_count)):
+        t = float(ring_index) / float(target_band_count)
+        out_sample = _sample_closed_loop_points(outer_pts, common_count)
+        in_sample = _sample_closed_loop_points(inner_pts, common_count)
+        pts = (1.0 - t) * out_sample + t * in_sample
+        generated_blocks.append(np.asarray(pts, dtype=float).reshape((common_count, 3)))
+        ids = tuple(range(next_generated_id, next_generated_id + common_count))
+        next_generated_id += common_count
+        ring_ids.append(ids)
+    ring_ids.append(tuple(int(v) for v in sorted_inner))
+
+    logical_quads: list[tuple[int, int, int, int]] = []
+    triangles: list[tuple[int, int, int]] = []
+    band_count_pairs: list[tuple[int, int]] = []
+    band_quad_counts: list[int] = []
+    band_triangle_counts: list[int] = []
+    band_adapter_kinds: list[str] = []
+    adaptive_collar_band_indices: list[int] = []
+    for band_index in range(len(ring_ids) - 1):
+        ring_a = tuple(int(v) for v in ring_ids[band_index])
+        ring_b = tuple(int(v) for v in ring_ids[band_index + 1])
+        band_count_pairs.append((int(len(ring_a)), int(len(ring_b))))
+        band_quads, band_tris, band_diag = _band_faces_between_rings_with_adaptive_sew_collar(ring_a, ring_b)
+        logical_quads.extend(band_quads)
+        triangles.extend(band_tris)
+        band_quad_counts.append(int(len(band_quads)))
+        band_triangle_counts.append(int(band_diag.get("triangle_count", 0)))
+        adapter_kind = str(band_diag.get("adapter_kind", "unknown"))
+        band_adapter_kinds.append(adapter_kind)
+        if bool(band_diag.get("adaptive_sew_collar_used", False)):
+            adaptive_collar_band_indices.append(int(band_index))
+
+    generated_vertices = np.vstack(generated_blocks).reshape((-1, 3)) if generated_blocks else np.zeros((0, 3), dtype=float)
+    diagnostics = {
+        **dict(alignment_diag),
+        "pocket_floor_fill_kind": "annular_adaptive_sew_collar_quad_grid_protected_child_bore_opening",
+        "pocket_floor_center_fan_used": False,
+        "pocket_floor_annular_fill_used": True,
+        "pocket_floor_annular_concentric_grid_used": True,
+        "pocket_floor_adaptive_sew_collar_used": bool(adaptive_collar_band_indices),
+        "pocket_floor_adaptive_sew_collar_band_indices": tuple(int(v) for v in adaptive_collar_band_indices),
+        "pocket_floor_annular_grid_contract_v104": "locked_outer_floor_perimeter_to_locked_child_bore_opening_with_adaptive_sew_collars_and_density_controlled_quad_interior",
+        "pocket_floor_annular_grid_contract_v103_reverted": "no_clean_fail_on_odd_count_delta; use adaptive sew collars instead of rejecting rebuild",
+        "pocket_floor_protected_inner_loop_count": 1,
+        "pocket_floor_outer_loop_vertex_count": int(n_outer),
+        "pocket_floor_inner_bore_loop_vertex_count": int(n_inner),
+        "pocket_floor_annular_common_interior_ring_count": int(common_count),
+        "pocket_floor_annular_radial_span": float(radial_span),
+        "pocket_floor_annular_median_edge_length": float(measured_edge),
+        "pocket_floor_annular_target_pitch": float(pitch),
+        "pocket_floor_annular_raw_radial_bands": int(raw_radial_bands),
+        "pocket_floor_annular_radial_band_count": int(len(ring_ids) - 1),
+        "pocket_floor_annular_generated_ring_count": int(max(0, len(ring_ids) - 2)),
+        "pocket_floor_annular_ring_count_sequence": tuple(int(len(v)) for v in ring_ids),
+        "pocket_floor_annular_band_count_pairs": tuple((int(a), int(b)) for a, b in band_count_pairs),
+        "pocket_floor_annular_band_adapter_kinds": tuple(str(v) for v in band_adapter_kinds),
+        "pocket_floor_annular_band_quad_counts": tuple(int(v) for v in band_quad_counts),
+        "pocket_floor_annular_band_triangle_counts": tuple(int(v) for v in band_triangle_counts),
+        "pocket_floor_annular_triangle_count_from_adaptive_collars": int(sum(band_triangle_counts)),
+        "pocket_floor_logical_quad_count": int(len(logical_quads)),
+        "pocket_floor_triangle_count": int(len(triangles)),
+        "pocket_floor_generated_vertex_count": int(len(generated_vertices)),
+        "quad_density_mode": str(mode_norm),
+        "semantic_floor_contract": "POCKET floor rebuilt as annular quad-grid interior with adaptive sew collars; protected child BORE opening remains open and separate",
+    }
+    return (
+        np.asarray(generated_vertices, dtype=float).reshape((-1, 3)),
+        np.asarray(triangles, dtype=np.int64).reshape((-1, 3)),
+        tuple(tuple(int(v) for v in quad) for quad in tuple(logical_quads or ())),
+        diagnostics,
+    )
+
+
+def _band_faces_between_rings_with_adaptive_sew_collar(
+    ring_a: tuple[int, ...],
+    ring_b: tuple[int, ...],
+) -> tuple[tuple[tuple[int, int, int, int], ...], tuple[tuple[int, int, int], ...], dict[str, object]]:
+    """Return runtime triangles and logical quads between two locked rings.
+
+    First try the existing all-quad transition band.  If locked loop counts make
+    that impossible, fall back to a local zipper-style adaptive sew collar.  The
+    fallback preserves all boundary vertices and consumes every boundary edge
+    exactly once; it is intentionally used only as the boundary adapter while
+    the annular floor interior remains regular quads.
+    """
+
+    a = tuple(int(v) for v in tuple(ring_a or ()))
+    b = tuple(int(v) for v in tuple(ring_b or ()))
+    n_a = int(len(a))
+    n_b = int(len(b))
+    if n_a < 3 or n_b < 3:
+        return (), (), {
+            "adapter_kind": "invalid_short_ring",
+            "adaptive_sew_collar_used": False,
+            "quad_count": 0,
+            "triangle_count": 0,
+        }
+
+    try:
+        quads = _band_quads_between_rings(a, b)
+        tris: list[tuple[int, int, int]] = []
+        for q in tuple(quads or ()): 
+            tris.append((int(q[0]), int(q[1]), int(q[2])))
+            tris.append((int(q[0]), int(q[2]), int(q[3])))
+        return (
+            tuple(tuple(int(v) for v in q) for q in tuple(quads or ())),
+            tuple(tuple(int(v) for v in tri) for tri in tris),
+            {
+                "adapter_kind": "pure_quad_transition_band",
+                "adaptive_sew_collar_used": False,
+                "quad_count": int(len(quads)),
+                "triangle_count": 0,
+                "ring_a_count": int(n_a),
+                "ring_b_count": int(n_b),
+            },
+        )
+    except Exception as exc:
+        quads, tris = _adaptive_zipper_sew_collar_faces_between_rings(a, b)
+        return (
+            tuple(tuple(int(v) for v in q) for q in tuple(quads or ())),
+            tuple(tuple(int(v) for v in tri) for tri in tuple(tris or ())),
+            {
+                "adapter_kind": "adaptive_zipper_sew_collar",
+                "adaptive_sew_collar_used": True,
+                "all_quad_transition_rejection": str(exc),
+                "quad_count": int(len(quads)),
+                "triangle_count": int(len(tris) - 2 * len(quads)),
+                "runtime_triangle_count": int(len(tris)),
+                "ring_a_count": int(n_a),
+                "ring_b_count": int(n_b),
+            },
+        )
+
+
+def _adaptive_zipper_sew_collar_faces_between_rings(
+    ring_a: tuple[int, ...],
+    ring_b: tuple[int, ...],
+) -> tuple[tuple[tuple[int, int, int, int], ...], tuple[tuple[int, int, int], ...]]:
+    """Build a local adaptive collar between arbitrary locked loop counts.
+
+    The output is quad-dominant where the angular steps coincide and uses local
+    transition triangles only where count parity/ratio makes an all-quad band
+    topologically impossible without splitting locked boundary edges.
+    """
+
+    a = tuple(int(v) for v in tuple(ring_a or ()))
+    b = tuple(int(v) for v in tuple(ring_b or ()))
+    n_a = int(len(a))
+    n_b = int(len(b))
+    if n_a < 3 or n_b < 3:
+        return (), ()
+
+    quads: list[tuple[int, int, int, int]] = []
+    triangles: list[tuple[int, int, int]] = []
+    ia = 0
+    ib = 0
+    ca = 0
+    cb = 0
+    eps = 1.0e-9
+    # Merge the two cyclic edge streams by normalized perimeter progress.  This
+    # consumes every boundary edge exactly once and never creates a split vertex
+    # on a locked loop.
+    while ca < n_a or cb < n_b:
+        next_a = float(ca + 1) / float(n_a) if ca < n_a else float("inf")
+        next_b = float(cb + 1) / float(n_b) if cb < n_b else float("inf")
+        if ca < n_a and cb < n_b and abs(next_a - next_b) <= eps:
+            q = (int(a[ia % n_a]), int(a[(ia + 1) % n_a]), int(b[(ib + 1) % n_b]), int(b[ib % n_b]))
+            quads.append(q)
+            triangles.append((q[0], q[1], q[2]))
+            triangles.append((q[0], q[2], q[3]))
+            ia += 1
+            ib += 1
+            ca += 1
+            cb += 1
+        elif ca < n_a and (cb >= n_b or next_a < next_b):
+            tri = (int(a[ia % n_a]), int(a[(ia + 1) % n_a]), int(b[ib % n_b]))
+            if len(set(tri)) == 3:
+                triangles.append(tri)
+            ia += 1
+            ca += 1
+        elif cb < n_b:
+            tri = (int(a[ia % n_a]), int(b[(ib + 1) % n_b]), int(b[ib % n_b]))
+            if len(set(tri)) == 3:
+                triangles.append(tri)
+            ib += 1
+            cb += 1
+        else:
+            break
+    return tuple(quads), tuple(triangles)
+
+
+def _pocket_floor_quad_grid_from_loop(
+    *,
+    vertices: np.ndarray,
+    loop_vertices: tuple[int, ...],
+    generated_vertex_offset: int,
+    quad_density_mode: str,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, int, int, int], ...], dict[str, object]]:
+    """Return a quad-dominant floor grid for the owned POCKET floor role.
+
+    This is the floor companion to the wall-loop quad rebuild.  The boundary
+    loop remains locked to the original pocket floor perimeter.  Generated
+    inner rings shrink toward the floor center and gradually reduce vertex
+    count down to a small even core loop, which is closed with logical quads.
+    No center-vertex fan is used for even boundary loops such as the current
+    126-vertex circular-pocket test.
+    """
+
+    loop = tuple(int(v) for v in tuple(loop_vertices or ()) if 0 <= int(v) < len(vertices))
+    if len(loop) < 4:
+        raise ValueError("Pocket quad floor requires at least four boundary vertices.")
+
+    n = int(len(loop))
+    if n % 2 == 0 and n >= 6:
+        target_count = 6
+        core_fill_kind = "two_logical_quads_hex_core"
+    elif n % 2 == 0 and n >= 4:
+        target_count = 4
+        core_fill_kind = "single_logical_quad_core"
+    else:
+        # A pure all-quad disk with an odd locked boundary is topologically not
+        # possible without inserting/splitting boundary vertices.  Keep this
+        # fallback explicit and diagnostic; current circular-pocket tests use an
+        # even boundary and therefore stay in the quad path.
+        return _pocket_floor_center_fan_fallback(
+            vertices=vertices,
+            loop_vertices=loop,
+            generated_vertex_offset=generated_vertex_offset,
+            reason="odd_locked_boundary_count_cannot_form_pure_quad_disk",
+        )
+
+    pts = vertices[np.asarray(loop, dtype=np.int64), :3]
+    center = np.mean(pts, axis=0).reshape(3)
+    # Use the existing density vocabulary, but apply it radially across the
+    # floor rather than axially along the wall.  The counts still control
+    # topology; density controls how many equal-count spacer bands appear.
+    base_counts = _transition_count_sequence(int(n), int(target_count), mode=quad_density_mode)
+    radial_span = float(np.median(np.linalg.norm(pts - center.reshape(1, 3), axis=1)))
+    edge_lengths = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
+    edge_lengths = edge_lengths[np.isfinite(edge_lengths) & (edge_lengths > 1.0e-12)]
+    measured_edge = float(np.median(edge_lengths)) if edge_lengths.size else 1.0
+    mode_norm = _normalize_quad_density_mode(quad_density_mode)
+    if mode_norm == QUAD_DENSITY_MODE_FULL:
+        pitch = max(float(measured_edge), 1.0e-12)
+        cap = 96
+    elif mode_norm == QUAD_DENSITY_MODE_PI:
+        pitch = max(2.5 * float(measured_edge), 1.0e-12)
+        cap = 64
+    else:
+        pitch = max(4.0 * float(measured_edge), 1.0e-12)
+        cap = 48
+    raw_radial_bands = int(math.ceil(radial_span / pitch)) if np.isfinite(radial_span) and radial_span > 1.0e-12 else len(base_counts) - 1
+    target_band_count = max(int(len(base_counts) - 1), min(int(cap), max(1, int(raw_radial_bands))))
+    counts = _densify_transition_count_sequence(base_counts, target_band_count=target_band_count)
+    counts = tuple(int(v) for v in counts if int(v) >= int(target_count))
+    if counts[0] != n:
+        counts = (int(n),) + tuple(counts)
+    if counts[-1] != target_count:
+        counts = tuple(counts) + (int(target_count),)
+
+    # Avoid a collapsed center: the final generated ring is a small measured
+    # floor core, then the core itself is closed with logical quads.
+    inner_scale = 0.08 if int(target_count) >= 6 else 0.12
+    band_count = max(1, len(counts) - 1)
+    generated_blocks: list[np.ndarray] = []
+    ring_ids: list[tuple[int, ...]] = [tuple(int(v) for v in loop)]
+    next_generated_id = int(len(vertices) + int(generated_vertex_offset))
+    for ring_index, count in enumerate(counts[1:], start=1):
+        t = float(ring_index) / float(band_count)
+        scale = (1.0 - t) + t * float(inner_scale)
+        sample = _sample_closed_loop_points(pts, int(count))
+        ring_pts = center.reshape(1, 3) + scale * (sample - center.reshape(1, 3))
+        generated_blocks.append(np.asarray(ring_pts, dtype=float).reshape((int(count), 3)))
+        ids = tuple(range(next_generated_id, next_generated_id + int(count)))
+        next_generated_id += int(count)
+        ring_ids.append(ids)
+
+    logical_quads: list[tuple[int, int, int, int]] = []
+    triangles: list[tuple[int, int, int]] = []
+    for band in range(len(ring_ids) - 1):
+        band_quads = _band_quads_between_rings(tuple(ring_ids[band]), tuple(ring_ids[band + 1]))
+        logical_quads.extend(band_quads)
+        for quad in band_quads:
+            triangles.append((int(quad[0]), int(quad[1]), int(quad[2])))
+            triangles.append((int(quad[0]), int(quad[2]), int(quad[3])))
+
+    core = tuple(int(v) for v in ring_ids[-1])
+    core_quads: tuple[tuple[int, int, int, int], ...]
+    if len(core) == 4:
+        core_quads = ((core[0], core[1], core[2], core[3]),)
+    elif len(core) == 6:
+        core_quads = ((core[0], core[1], core[2], core[3]), (core[0], core[3], core[4], core[5]))
+    else:
+        # Keep the function honest if the target count is changed later.
+        return _pocket_floor_center_fan_fallback(
+            vertices=vertices,
+            loop_vertices=loop,
+            generated_vertex_offset=generated_vertex_offset,
+            reason=f"unsupported_core_loop_count_{len(core)}",
+        )
+    logical_quads.extend(core_quads)
+    for quad in core_quads:
+        triangles.append((int(quad[0]), int(quad[1]), int(quad[2])))
+        triangles.append((int(quad[0]), int(quad[2]), int(quad[3])))
+
+    generated_vertices = np.vstack(generated_blocks).reshape((-1, 3)) if generated_blocks else np.zeros((0, 3), dtype=float)
+    diag = {
+        "pocket_floor_fill_kind": "quad_grid",
+        "pocket_floor_grid_contract_v100": "locked_floor_perimeter_to_concentric_quad_grid_no_center_fan",
+        "pocket_floor_boundary_vertex_count": int(n),
+        "pocket_floor_inner_core_vertex_count": int(target_count),
+        "pocket_floor_core_fill_kind": str(core_fill_kind),
+        "pocket_floor_ring_count_sequence": tuple(int(v) for v in counts),
+        "pocket_floor_radial_band_count": int(len(ring_ids) - 1),
+        "pocket_floor_generated_ring_count": int(max(0, len(ring_ids) - 1)),
+        "pocket_floor_generated_vertex_count": int(len(generated_vertices)),
+        "pocket_floor_logical_quad_count": int(len(logical_quads)),
+        "pocket_floor_triangle_count": int(len(triangles)),
+        "pocket_floor_center_fan_used": False,
+        "quad_density_mode": str(_normalize_quad_density_mode(quad_density_mode)),
+    }
+    return (
+        np.asarray(generated_vertices, dtype=float).reshape((-1, 3)),
+        np.asarray(triangles, dtype=np.int64).reshape((-1, 3)),
+        tuple((int(a), int(b), int(c), int(d)) for a, b, c, d in logical_quads),
+        diag,
+    )
+
+
+def _pocket_floor_center_fan_fallback(
+    *,
+    vertices: np.ndarray,
+    loop_vertices: tuple[int, ...],
+    generated_vertex_offset: int,
+    reason: str,
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, int, int, int], ...], dict[str, object]]:
+    """Fallback only for non-quad-compatible locked boundaries."""
+
+    loop = tuple(int(v) for v in tuple(loop_vertices or ()) if 0 <= int(v) < len(vertices))
+    if len(loop) < 3:
+        raise ValueError("Pocket floor fallback requires at least three boundary vertices.")
+    pts = vertices[np.asarray(loop, dtype=np.int64), :3]
+    center = np.mean(pts, axis=0).reshape(1, 3)
+    center_id = int(len(vertices) + int(generated_vertex_offset))
+    triangles = [(int(a), int(loop[(i + 1) % len(loop)]), int(center_id)) for i, a in enumerate(loop)]
+    return (
+        np.asarray(center, dtype=float).reshape((1, 3)),
+        np.asarray(triangles, dtype=np.int64).reshape((-1, 3)),
+        (),
+        {
+            "pocket_floor_fill_kind": "diagnostic_center_fan_fallback",
+            "pocket_floor_center_fan_used": True,
+            "pocket_floor_quad_fallback_reason": str(reason),
+            "pocket_floor_logical_quad_count": 0,
+            "pocket_floor_triangle_count": int(len(triangles)),
+            "pocket_floor_generated_vertex_count": 1,
+        },
+    )
+
+
+def _orient_triangles_to_source_role_normal(
+    *,
+    vertices: np.ndarray,
+    generated_vertices: np.ndarray,
+    triangles: np.ndarray,
+    source_faces: np.ndarray,
+    face_ids: tuple[int, ...],
+    fallback_normal: np.ndarray,
+) -> np.ndarray:
+    """Orient a generated role surface by the averaged source role normal."""
+
+    refs = _source_patch_face_references(vertices=vertices, source_faces=source_faces, face_ids=face_ids)
+    normals = [np.asarray(item[1], dtype=float).reshape(3) for item in refs]
+    role_normal = _unit_normal(np.sum(np.asarray(normals, dtype=float).reshape((-1, 3)), axis=0)) if normals else None
+    if role_normal is None:
+        role_normal = _unit_vector(fallback_normal)
+
+    output_vertices = np.asarray(vertices, dtype=float).copy()
+    gen = np.asarray(generated_vertices, dtype=float).reshape((-1, 3))
+    if gen.size:
+        output_vertices = np.vstack([output_vertices, gen])
+    tris = np.asarray(triangles, dtype=np.int64).reshape((-1, 3)).copy()
+    for tri_index, tri in enumerate(tris):
+        if any(int(v) < 0 or int(v) >= len(output_vertices) for v in tri):
+            continue
+        pts = output_vertices[np.asarray(tri, dtype=np.int64), :3]
+        normal = _unit_normal(np.cross(pts[1] - pts[0], pts[2] - pts[0]))
+        if normal is not None and float(np.dot(normal, role_normal)) < 0.0:
+            tris[tri_index] = np.asarray((int(tri[0]), int(tri[2]), int(tri[1])), dtype=np.int64)
+    return tris
+
+
+def _orient_pocket_wall_triangles_by_radial_role(
+    *,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    face_ids: tuple[int, ...],
+    plan: QuadPlan,
+) -> QuadPlan:
+    """Orient pocket wall triangles by the wall role's radial normal sign.
+
+    Nearest-face orientation can preserve source-mesh normal noise.  For the
+    circular-pocket side wall, the stronger role rule is radial: generated wall
+    normals should have the same inward/outward sign relative to the pocket axis
+    as the owned source wall faces.
+    """
+
+    refs = _source_patch_face_references(vertices=vertices, source_faces=source_faces, face_ids=face_ids)
+    axis_vec = _unit_vector(plan.axis)
+    base = 0.5 * (np.asarray(plan.center0, dtype=float).reshape(3) + np.asarray(plan.center1, dtype=float).reshape(3))
+
+    def radial_unit(point: np.ndarray) -> np.ndarray | None:
+        rel = np.asarray(point, dtype=float).reshape(3) - base
+        axial = float(np.dot(rel, axis_vec))
+        radial = rel - axial * axis_vec
+        length = float(np.linalg.norm(radial))
+        if not np.isfinite(length) or length <= 1.0e-12:
+            return None
+        return radial / length
+
+    signs: list[float] = []
+    for centroid, normal in refs:
+        r = radial_unit(np.asarray(centroid, dtype=float).reshape(3))
+        if r is None:
+            continue
+        dot = float(np.dot(np.asarray(normal, dtype=float).reshape(3), r))
+        if np.isfinite(dot) and abs(dot) > 1.0e-6:
+            signs.append(dot)
+    if not signs:
+        return plan
+    role_sign = 1.0 if float(np.median(np.asarray(signs, dtype=float))) >= 0.0 else -1.0
+
+    output_vertices = np.asarray(vertices, dtype=float).copy()
+    gen = np.asarray(plan.generated_vertices, dtype=float).reshape((-1, 3))
+    if gen.size:
+        output_vertices = np.vstack([output_vertices, gen])
+    tris = np.asarray(plan.triangles, dtype=np.int64).reshape((-1, 3)).copy()
+    flips = 0
+    checked = 0
+    for tri_index, tri in enumerate(tris):
+        if any(int(v) < 0 or int(v) >= len(output_vertices) for v in tri):
+            continue
+        pts = output_vertices[np.asarray(tri, dtype=np.int64), :3]
+        normal = _unit_normal(np.cross(pts[1] - pts[0], pts[2] - pts[0]))
+        r = radial_unit(np.mean(pts, axis=0))
+        if normal is None or r is None:
+            continue
+        checked += 1
+        if float(np.dot(normal, r)) * role_sign < 0.0:
+            tris[tri_index] = np.asarray((int(tri[0]), int(tri[2]), int(tri[1])), dtype=np.int64)
+            flips += 1
+    diag = dict(plan.diagnostics)
+    diag.update({
+        "pocket_wall_normal_orientation_policy_v100": "radial_role_sign_from_owned_source_wall_faces",
+        "pocket_wall_radial_normal_role_sign": float(role_sign),
+        "pocket_wall_radial_orientation_checked_triangle_count": int(checked),
+        "pocket_wall_radial_orientation_flip_count": int(flips),
+    })
+    return QuadPlan(
+        generated_vertices=plan.generated_vertices,
+        triangles=tris,
+        logical_quads=plan.logical_quads,
+        loop0=plan.loop0,
+        loop1=plan.loop1,
+        center0=plan.center0,
+        center1=plan.center1,
+        axis=plan.axis,
+        diagnostics=diag,
+    )
+
+
+def _pocket_recess_cup_trial_accepts(*, trial: Mapping[str, object], plan: QuadPlan) -> bool:
+    """Strict local acceptance for a POCKET recessed cup on non-watertight meshes."""
+
+    diag = dict(getattr(plan, "diagnostics", {}) or {})
+    boundary_match = bool(diag.get("boundary_match_exact", False))
+    missing = _int_preserve_zero(diag.get("missing_patch_boundary_edge_count", -1), -1)
+    extra = _int_preserve_zero(diag.get("extra_generated_boundary_edge_count", -1), -1)
+    patch_edges = _int_preserve_zero(diag.get("patch_boundary_edge_count", -1), -1)
+    generated_edges = _int_preserve_zero(diag.get("generated_boundary_edge_count", -1), -1)
+    generated_original_boundary = _int_preserve_zero(diag.get("generated_boundary_original_vertex_edge_count", -1), -1)
+    generated_new_boundary = _int_preserve_zero(diag.get("generated_boundary_generated_vertex_edge_count", -1), -1)
+    before = _int_preserve_zero(trial.get("boundary_edge_count_before", -1), -1)
+    after = _int_preserve_zero(trial.get("boundary_edge_count_after", -1), -1)
+    return bool(
+        boundary_match
+        and missing == 0
+        and extra == 0
+        and patch_edges > 0
+        and generated_edges == patch_edges
+        and generated_original_boundary == patch_edges
+        and generated_new_boundary == 0
+        and before >= 0
+        and after <= before
+    )
+
+# -----------------------------------------------------------------------------
+# POCKET v96: cap-style pocket delete/rebuild
+# -----------------------------------------------------------------------------
+
+
+def _candidate_requests_pocket_cap_rebuild(*, context: RebuildCandidateContext, candidate_metadata: Mapping[str, object]) -> bool:
+    """Return True for the pocket-specific floor+wall delete/cap path."""
+
+    entity = str(getattr(context, "entity_type", "") or "").strip().lower()
+    family = str(candidate_metadata.get("feature_family", "") or "").strip().lower()
+    action = str(candidate_metadata.get("candidate_action", "") or "").strip().lower()
+    gate = str(getattr(context, "rebuild_gate", "") or "").strip().lower()
+    scope = str(candidate_metadata.get("pocket_rebuild_enable_scope", "") or "").strip().lower()
+    return bool(
+        entity in {"pocket", "circular_pocket"}
+        or family in {"pocket", "circular_pocket"}
+    ) and bool(
+        "cap" in action
+        or "cap" in gate
+        or "cap" in scope
+        or "floor_and_sidewall" in action
+        or "side_wall_plus_floor" in scope
+    )
+
+
+def _delete_pocket_and_fill_opening_cap(
+    *,
+    mesh: trimesh.Trimesh,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    face_ids: tuple[int, ...],
+    selected_edge_ids: tuple[int, ...],
+    candidate_metadata: Mapping[str, object],
+    context: RebuildCandidateContext,
+    axis: np.ndarray,
+    radius: float,
+    color_rebuilt_faces: bool,
+    base_face_color: RGBA,
+    rebuilt_face_color: RGBA,
+) -> RebuildResult:
+    """Delete owned pocket side-wall+floor faces and fill the opening loop.
+
+    This is intentionally separate from the measured-loop sleeve rebuild.  A
+    pocket cleanup target has one surviving parent-surface opening boundary after
+    the floor is included in the delete patch.  The correct local rebuild is a
+    planar cap bounded by that one loop, not a two-loop wall replacement.
+    """
+
+    patch_faces = _normalize_face_ids(face_ids, face_count=len(source_faces))
+    if not patch_faces:
+        raise ValueError("Pocket cap rebuild received no owned floor/side-wall delete faces. Geometry changed: no.")
+
+    loops = _candidate_patch_boundary_edge_loops(source_faces=source_faces, face_ids=patch_faces)
+    if not loops:
+        raise ValueError(
+            "Pocket cap rebuild could not find a closed opening boundary after deleting owned floor+side-wall faces. "
+            f"delete_face_count={len(patch_faces)}; Geometry changed: no."
+        )
+
+    # The valid first pocket target is one main parent-surface opening loop.  If
+    # small stray components exist, keep the largest loop but report them.  This
+    # keeps the trial bounded to the user-selected pocket rather than falling
+    # back to RegionData.
+    main_loop = max(loops, key=lambda row: int(row.get("edge_count", 0) or 0))
+    loop_vertices = tuple(int(v) for v in tuple(main_loop.get("vertices", ()) or ()))
+    if len(loop_vertices) < 3:
+        raise ValueError(
+            "Pocket cap rebuild opening loop has too few vertices. "
+            f"loop_vertex_count={len(loop_vertices)}; delete_face_count={len(patch_faces)}; Geometry changed: no."
+        )
+
+    normal_hint = _unit_vector(candidate_metadata.get("axis", axis), fallback=axis)
+    center = _loop_center(vertices, loop_vertices)
+    generated_vertices = np.asarray([center], dtype=float).reshape((1, 3))
+    center_index = int(len(vertices))
+    triangles = _cap_triangles_for_loop(loop_vertices=loop_vertices, center_index=center_index, vertices=vertices, normal_hint=normal_hint)
+    if triangles.size == 0:
+        raise ValueError(
+            "Pocket cap rebuild failed to generate cap triangles. "
+            f"loop_vertex_count={len(loop_vertices)}; Geometry changed: no."
+        )
+
+    boundary_match = _generated_surface_boundary_match_diagnostics(
+        source_faces=source_faces,
+        face_ids=patch_faces,
+        triangles=triangles,
+        source_vertex_count=int(len(vertices)),
+    )
+    trial = _trial_rebuild(
+        vertices=vertices,
+        source_faces=source_faces,
+        face_ids=patch_faces,
+        generated_vertices=generated_vertices,
+        triangles=triangles,
+    )
+
+    patch_boundary_edges = int(boundary_match.get("patch_boundary_edge_count", 0) or 0)
+    generated_boundary_edges = _int_preserve_zero(boundary_match.get("generated_boundary_edge_count", -1), -1)
+    missing = int(boundary_match.get("missing_patch_boundary_edge_count", 1) or 0)
+    extra = int(boundary_match.get("extra_generated_boundary_edge_count", 1) or 0)
+    before = int(trial.get("boundary_edge_count_before", -1) if trial.get("boundary_edge_count_before", -1) is not None else -1)
+    after = int(trial.get("boundary_edge_count_after", -1) if trial.get("boundary_edge_count_after", -1) is not None else -1)
+    local_accept = bool(
+        bool(boundary_match.get("boundary_match_exact", False))
+        and patch_boundary_edges > 0
+        and generated_boundary_edges == patch_boundary_edges
+        and missing == 0
+        and extra == 0
+        and before >= 0
+        and after <= before
+    )
+    if not (bool(trial.get("watertight_after", False)) or local_accept):
+        raise ValueError(
+            "Pocket cap rebuild local topology trial rejected. "
+            f"delete_face_count={len(patch_faces)}; loop_count={len(loops)}; loop_vertex_count={len(loop_vertices)}; "
+            f"boundary_edge_count_before={before}; boundary_edge_count_after={after}; "
+            f"watertight_after={bool(trial.get('watertight_after', False))}; "
+            f"boundary_match_exact={bool(boundary_match.get('boundary_match_exact', False))}; "
+            f"patch_boundary_edge_count={patch_boundary_edges}; generated_boundary_edge_count={generated_boundary_edges}; "
+            f"missing_patch_boundary_edge_count={missing}; extra_generated_boundary_edge_count={extra}; "
+            "Geometry changed: no."
+        )
+
+    result = _apply_rebuild(
+        mesh=mesh,
+        vertices=vertices,
+        source_faces=source_faces,
+        face_ids=patch_faces,
+        generated_vertices=generated_vertices,
+        triangles=triangles,
+        color_rebuilt_faces=bool(color_rebuilt_faces),
+        base_face_color=base_face_color,
+        rebuilt_face_color=rebuilt_face_color,
+    )
+
+    diagnostics: dict[str, object] = {
+        "mode": "pocket_cap_rebuild_v96",
+        "topology_policy": "owned_pocket_floor_plus_sidewall_delete_single_opening_loop_planar_cap_v96",
+        "candidate_entity_type": context.entity_type or "pocket",
+        "candidate_rebuild_gate": context.rebuild_gate,
+        "candidate_role": context.role,
+        "candidate_from_component_engine": bool(context.candidate_from_component_engine),
+        "candidate_feature_ownership_source": context.feature_ownership_source,
+        "candidate_has_preview_face_patch": bool(context.candidate_has_preview_face_patch),
+        "preview_candidate_patch_owns_delete": bool(context.candidate_has_preview_face_patch),
+        "selected_edge_count": int(len(selected_edge_ids)),
+        "removed_face_count": int(len(patch_faces)),
+        "pocket_floor_face_count": int(len(_normalize_face_ids(candidate_metadata.get("pocket_floor_face_ids", ()), face_count=len(source_faces)))),
+        "pocket_side_wall_face_count": int(len(_normalize_face_ids(candidate_metadata.get("pocket_side_wall_face_ids", ()), face_count=len(source_faces)))),
+        "pocket_transition_face_count": int(len(_normalize_face_ids(candidate_metadata.get("pocket_transition_face_ids", ()), face_count=len(source_faces)))),
+        "pocket_cap_loop_count": int(len(loops)),
+        "pocket_cap_loop_vertex_count": int(len(loop_vertices)),
+        "pocket_cap_loop_edge_count": int(main_loop.get("edge_count", len(loop_vertices)) or len(loop_vertices)),
+        "pocket_cap_generated_center_vertex_count": 1,
+        "pocket_cap_added_triangle_count": int(len(triangles)),
+        "pocket_cap_fill_acceptance_contract_v96": "delete_owned_floor_plus_side_wall_faces_fill_single_parent_opening_loop_no_missing_or_extra_generated_boundary_edges",
+        "pocket_cap_local_topology_acceptance_used": bool(local_accept and not bool(trial.get("watertight_after", False))),
+        "watertight_after": bool(trial.get("watertight_after", False)),
+        "boundary_edge_count_before": before,
+        "boundary_edge_count_after": after,
+        "boundary_edge_count_delta": int(trial.get("boundary_edge_count_delta", after - before)),
+        "quad_plan": {
+            "geometry_source": "pocket_opening_boundary_loop_planar_cap",
+            "cap_center": _to_vector3(center),
+            "cap_normal_hint": _to_vector3(normal_hint),
+            **dict(boundary_match),
+        },
+        "parameter_fit_used": False,
+        "radius_used_for_delete_expansion": False,
+        "axis_used_for_delete_expansion": False,
+        "radius_used_for_vertex_placement": False,
+        "axis_used_for_vertex_placement": False,
+        "existing_boundary_vertices_moved": 0,
+        "region_data_as_rebuild_input_enabled": False,
+        "floor_rebuild_method": "floor_is_deleted_with_side_walls_then_opening_is_capped",
+    }
+
+    return RebuildResult(
+        mesh=result["mesh"],
+        removed_face_ids=patch_faces,
+        added_face_ids=result["added_face_ids"],
+        added_faces=tuple(tuple(int(v) for v in tri) for tri in triangles.tolist()),
+        loop0_vertices=loop_vertices,
+        loop1_vertices=(),
+        axis=_to_vector3(normal_hint),
+        radius=float(radius),
+        diagnostics=diagnostics,
+    )
+
+
+def _cap_triangles_for_loop(*, loop_vertices: tuple[int, ...], center_index: int, vertices: np.ndarray, normal_hint: np.ndarray) -> np.ndarray:
+    loop = tuple(int(v) for v in tuple(loop_vertices or ()) if 0 <= int(v) < len(vertices))
+    if len(loop) < 3:
+        return np.zeros((0, 3), dtype=np.int64)
+    tris = np.asarray([[loop[i], loop[(i + 1) % len(loop)], int(center_index)] for i in range(len(loop))], dtype=np.int64)
+    normal = _triangle_set_area_normal(vertices=vertices, triangles=tris, generated_center_index=int(center_index))
+    hint = _unit_vector(normal_hint, fallback=(0.0, 0.0, 1.0))
+    if float(np.dot(normal, hint)) < 0.0:
+        tris = np.asarray([[loop[(i + 1) % len(loop)], loop[i], int(center_index)] for i in range(len(loop))], dtype=np.int64)
+    return tris
+
+
+def _triangle_set_area_normal(*, vertices: np.ndarray, triangles: np.ndarray, generated_center_index: int) -> np.ndarray:
+    arr = np.asarray(vertices, dtype=float)[:, :3]
+    center_point = None
+    if int(generated_center_index) >= len(arr):
+        # The cap center is the mean of the original boundary vertices used in
+        # the fan.  It is reconstructed here only for orientation testing.
+        original_ids = sorted({int(v) for tri in np.asarray(triangles, dtype=np.int64).reshape((-1, 3)) for v in tri if 0 <= int(v) < len(arr)})
+        center_point = np.mean(arr[np.asarray(original_ids, dtype=np.int64), :3], axis=0) if original_ids else np.zeros(3, dtype=float)
+    acc = np.zeros(3, dtype=float)
+    for tri in np.asarray(triangles, dtype=np.int64).reshape((-1, 3)):
+        pts = []
+        for raw in tri[:3]:
+            idx = int(raw)
+            if 0 <= idx < len(arr):
+                pts.append(arr[idx, :3])
+            elif idx == int(generated_center_index) and center_point is not None:
+                pts.append(center_point)
+        if len(pts) == 3:
+            acc += np.cross(pts[1] - pts[0], pts[2] - pts[0])
+    return _unit_vector(acc, fallback=(0.0, 0.0, 1.0))
+
+
 # -----------------------------------------------------------------------------
 # Stage 1: request/candidate normalization
 # -----------------------------------------------------------------------------
@@ -543,9 +1971,9 @@ def _candidate_context(
             "Bore rebuild rejected before target construction: CandidateData is not an accepted candidate. "
             f"recognition_stage={recognition_stage!r}; feature_family={feature_family!r}; Geometry changed: no."
         )
-    if feature_family and feature_family not in {FeatureFamily.BORE.value, FeatureFamily.CHAMFER_FORM.value}:
+    if feature_family and feature_family not in {FeatureFamily.BORE.value, FeatureFamily.CHAMFER_FORM.value, FeatureFamily.POCKET.value, FeatureFamily.CIRCULAR_POCKET.value}:
         raise ValueError(
-            "Bore rebuild rejected before target construction: feature family has no rebuild implementation yet. "
+            "Bore rebuild rejected before target construction: feature family has no rebuild implementation in the active side-wall rebuild trial. "
             f"recognition_stage={recognition_stage!r}; feature_family={feature_family!r}; Geometry changed: no."
         )
     role = str(candidate_metadata.get("role", candidate_metadata.get("rebuild_role", "")) or "").strip().lower()
@@ -559,6 +1987,18 @@ def _candidate_context(
         or str(candidate_metadata.get("recognition_rule", "") or "").startswith("connected_")
     )
     is_borehole = bool(entity_type in {"borehole", "core_bore_cylinder_candidate"} or "borehole" in rebuild_gate or "core_bore" in role)
+    damaged_bore_rebuild_trial = bool(
+        is_borehole
+        and (
+            bool(candidate_metadata.get("damaged_bore_rebuild_trial_enabled", False))
+            or bool(candidate_metadata.get("requires_damaged_bore_target_seal", False))
+            or str(candidate_metadata.get("candidate_variant", "") or "").strip().lower() == "damaged_bore"
+            or "damaged_bore" in rebuild_gate
+            or "damaged_bore" in role
+            or "damaged_bore" in ownership
+            or "boundary_defect" in str(candidate_metadata.get("surface_condition", "") or "").strip().lower()
+        )
+    )
     is_chamfer = bool(entity_type == "chamfer" or rebuild_gate == "promoted_chamfer_candidate")
     is_counterbore = bool(entity_type == "counterbore" or "counterbore" in rebuild_gate)
     is_pocket = bool(entity_type in {"pocket", "circular_pocket"} or "pocket" in rebuild_gate)
@@ -573,6 +2013,7 @@ def _candidate_context(
         candidate_has_preview_face_patch=bool(region_face_ids),
         allows_unequal_loop_transition=allows_unequal,
         quad_density_mode=_resolve_quad_density_mode(explicit_quad_density_mode, candidate_metadata),
+        damaged_bore_rebuild_trial=bool(damaged_bore_rebuild_trial),
     )
 
 
@@ -1536,6 +2977,262 @@ def _candidate_patch_boundary_vertex_loops(
     return tuple(loops)
 
 
+
+
+def _two_opening_frame_from_candidate_metadata(candidate_metadata: Mapping[str, object]) -> dict[str, object] | None:
+    """Extract the accepted two-opening BoreFrame carried by CandidateData.
+
+    Recognition owns the measured frame.  Rebuild may use it only as bounded
+    target evidence after CandidateData is already accepted/rebuildable.
+    """
+
+    meta = dict(candidate_metadata or {})
+    diag = meta.get("diagnostics")
+    if not isinstance(diag, Mapping):
+        diag = {}
+    # v1.6.6: prefer the operational owned-bore frame produced after
+    # BoreWallOwnership.  The original measured two-opening frame may have used
+    # an internal damaged ring as provisional opposite evidence.
+    frame = diag.get("owned_bore_frame") if isinstance(diag, Mapping) else None
+    if not isinstance(frame, Mapping):
+        frame = meta.get("owned_bore_frame")
+    if not isinstance(frame, Mapping):
+        frame = diag.get("two_opening_bore_frame") if isinstance(diag, Mapping) else None
+    if not isinstance(frame, Mapping):
+        frame = meta.get("two_opening_bore_frame")
+    if not isinstance(frame, Mapping):
+        return None
+    try:
+        opening_center = np.asarray(frame.get("opening_center", ()), dtype=float).reshape(3)
+        opposite_center = np.asarray(frame.get("opposite_center", ()), dtype=float).reshape(3)
+    except Exception:
+        return None
+    delta = opposite_center - opening_center
+    depth = float(np.linalg.norm(delta))
+    axis = _unit_vector(delta if np.isfinite(depth) and depth > 1.0e-9 else frame.get("axis", meta.get("primitive_axis", (0.0, 0.0, 1.0))))
+    explicit_depth = _safe_float(frame.get("depth", meta.get("owned_bore_frame_depth", meta.get("depth", 0.0))), 0.0)
+    if explicit_depth > max(depth, 0.0) + max(1.0e-6, 0.005 * max(depth, 1.0)):
+        depth = float(explicit_depth)
+        opposite_center = opening_center + axis.reshape(3) * float(depth)
+    if not np.isfinite(depth) or depth <= 1.0e-9:
+        depth = float(explicit_depth)
+    radius = _safe_float(frame.get("radius", meta.get("radius", meta.get("primitive_radius", 0.0))), 0.0)
+    if radius <= 1.0e-9 or depth <= 1.0e-9:
+        return None
+    return {
+        "opening_center": opening_center,
+        "opposite_center": opposite_center,
+        "axis": axis,
+        "radius": float(radius),
+        "depth": float(depth),
+        "frame_source": str(frame.get("status", meta.get("bore_frame_depth_source", "candidate_owned_bore_frame"))),
+    }
+
+
+def _protected_loop_pair_from_candidate_frame(
+    *,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    frame: Mapping[str, object],
+    preferred_pool: Iterable[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Find both physical rim loops from the accepted candidate BoreFrame."""
+
+    loop_a = _edge_loop_near_frame_opening(
+        vertices=vertices,
+        source_faces=source_faces,
+        center=np.asarray(frame.get("opening_center"), dtype=float).reshape(3),
+        axis=_unit_vector(frame.get("axis", (0.0, 0.0, 1.0))),
+        radius=_safe_float(frame.get("radius", 0.0), 0.0),
+        preferred_pool=preferred_pool,
+    )
+    loop_b = _edge_loop_near_frame_opening(
+        vertices=vertices,
+        source_faces=source_faces,
+        center=np.asarray(frame.get("opposite_center"), dtype=float).reshape(3),
+        axis=_unit_vector(frame.get("axis", (0.0, 0.0, 1.0))),
+        radius=_safe_float(frame.get("radius", 0.0), 0.0),
+        preferred_pool=preferred_pool,
+    )
+    if loop_a is None or loop_b is None:
+        return None
+    if set(loop_a) == set(loop_b):
+        return None
+    return (loop_a, loop_b)
+
+
+def _edge_loop_near_frame_opening(
+    *,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+    radius: float,
+    preferred_pool: Iterable[int],
+) -> tuple[int, ...] | None:
+    """Measure a rim loop near one BoreFrame opening from mesh edges."""
+
+    radius = float(radius)
+    if radius <= 1.0e-9:
+        return None
+    faces_arr = np.asarray(source_faces, dtype=np.int64)[:, :3]
+    edge_to_faces = build_edge_to_faces(faces_arr)
+    pool = {int(fid) for fid in tuple(preferred_pool or ()) if 0 <= int(fid) < len(faces_arr)}
+    axis_vec = _unit_vector(axis)
+    edge_lengths: list[float] = []
+    for edge in edge_to_faces.keys():
+        a, b = int(edge[0]), int(edge[1])
+        if 0 <= a < len(vertices) and 0 <= b < len(vertices):
+            length = float(np.linalg.norm(vertices[a, :3] - vertices[b, :3]))
+            if np.isfinite(length) and length > 1.0e-12:
+                edge_lengths.append(length)
+    edge_scale = float(np.median(edge_lengths)) if edge_lengths else 1.0
+    plane_tol = max(0.085 * radius, 4.5 * edge_scale, 0.30)
+    radial_tol = max(0.105 * radius, 4.5 * edge_scale, 0.35)
+
+    selected_edges: set[EdgeKey] = set()
+    for edge, adjacent in edge_to_faces.items():
+        if pool and not any(int(fid) in pool for fid in tuple(adjacent or ())):
+            continue
+        a, b = int(edge[0]), int(edge[1])
+        if not (0 <= a < len(vertices) and 0 <= b < len(vertices)):
+            continue
+        pa = vertices[a, :3]
+        pb = vertices[b, :3]
+        mid = 0.5 * (pa + pb)
+        rel = mid - center.reshape(3)
+        axial = float(np.dot(rel, axis_vec))
+        radial_vec = rel - axial * axis_vec
+        radial = float(np.linalg.norm(radial_vec))
+        if not np.isfinite(axial) or not np.isfinite(radial):
+            continue
+        if abs(axial) > plane_tol or abs(radial - radius) > radial_tol:
+            continue
+        tangent = pb - pa
+        tlen = float(np.linalg.norm(tangent))
+        if tlen <= 1.0e-12:
+            continue
+        tangent = tangent / tlen
+        radial_unit = radial_vec / max(radial, 1.0e-12)
+        radial_tangent = abs(float(np.dot(tangent, radial_unit))) if radial > 1.0e-12 else 0.0
+        axial_tangent = abs(float(np.dot(tangent, axis_vec)))
+        if radial_tangent > 0.92 and axial_tangent < 0.35:
+            continue
+        selected_edges.add(_edge_key(edge))
+
+    if len(selected_edges) < 6:
+        return None
+    best_loop: tuple[int, ...] | None = None
+    best_score = -1.0
+    for comp in edge_loop_components(selected_edges):
+        ordered = _order_closed_edge_loop_vertices({_edge_key(edge) for edge in tuple(comp or ())})
+        if not bool(ordered.get("closed", False)):
+            continue
+        verts = tuple(int(v) for v in tuple(ordered.get("vertices", ()) or ()))
+        if len(verts) < 6:
+            continue
+        pts = vertices[np.asarray(verts, dtype=np.int64), :3]
+        rel = pts - center.reshape(1, 3)
+        axial_values = rel @ axis_vec.reshape(3)
+        radial_vecs = rel - axial_values.reshape(-1, 1) * axis_vec.reshape(1, 3)
+        radii = np.linalg.norm(radial_vecs, axis=1)
+        radial_mad = float(np.median(np.abs(radii - radius))) if radii.size else 999999.0
+        plane_mad = float(np.median(np.abs(axial_values))) if axial_values.size else 999999.0
+        score = float(len(verts)) - 4.0 * radial_mad - 2.0 * plane_mad
+        if score > best_score:
+            best_score = score
+            best_loop = verts
+    return best_loop
+
+
+def _full_depth_bore_wall_target_faces_from_candidate_frame(
+    *,
+    vertices: np.ndarray,
+    source_faces: np.ndarray,
+    frame: Mapping[str, object],
+    face_pool: Iterable[int],
+    base_face_ids: Iterable[int],
+) -> tuple[tuple[int, ...], dict[str, object]]:
+    """Build a bounded full-depth wall delete target from CandidateData frame.
+
+    This is used only for accepted damaged BoreWallOwnership.  It does not let
+    RegionData become ownership; the candidate's two-opening frame and wall role
+    define the target, while RegionData merely bounds the search pool.
+    """
+
+    faces_arr = np.asarray(source_faces, dtype=np.int64)[:, :3]
+    pool = {int(fid) for fid in tuple(face_pool or ()) if 0 <= int(fid) < len(faces_arr)}
+    base = {int(fid) for fid in tuple(base_face_ids or ()) if 0 <= int(fid) < len(faces_arr)}
+    if not pool:
+        pool = set(range(len(faces_arr)))
+    opening_center = np.asarray(frame.get("opening_center"), dtype=float).reshape(3)
+    opposite_center = np.asarray(frame.get("opposite_center"), dtype=float).reshape(3)
+    axis_vec = _unit_vector(frame.get("axis", opposite_center - opening_center), fallback=opposite_center - opening_center)
+    radius = _safe_float(frame.get("radius", 0.0), 0.0)
+    depth = float(np.linalg.norm(opposite_center - opening_center))
+    if radius <= 1.0e-9 or depth <= 1.0e-9:
+        return tuple(sorted(base)), {"used": False, "reason": "invalid_candidate_frame"}
+
+    tri = vertices[faces_arr[:, :3], :3]
+    centroids = tri.mean(axis=1)
+    raw_normals = np.cross(tri[:, 1, :] - tri[:, 0, :], tri[:, 2, :] - tri[:, 0, :])
+    nlen = np.linalg.norm(raw_normals, axis=1)
+    normals = np.zeros_like(raw_normals)
+    okn = np.isfinite(nlen) & (nlen > 1.0e-12)
+    normals[okn] = raw_normals[okn] / nlen[okn].reshape(-1, 1)
+
+    rel_cent = centroids - opening_center.reshape(1, 3)
+    axial_cent = rel_cent @ axis_vec.reshape(3)
+    radial_vec_cent = rel_cent - axial_cent.reshape(-1, 1) * axis_vec.reshape(1, 3)
+    radial_cent = np.linalg.norm(radial_vec_cent, axis=1)
+    radial_dir = np.zeros_like(radial_vec_cent)
+    okr = radial_cent > 1.0e-12
+    radial_dir[okr] = radial_vec_cent[okr] / radial_cent[okr].reshape(-1, 1)
+    normal_axis_abs = np.abs(normals @ axis_vec.reshape(3))
+    radial_normal_alignment = np.abs(np.sum(normals * radial_dir, axis=1))
+
+    tri_rel = tri - opening_center.reshape(1, 1, 3)
+    tri_ax = tri_rel @ axis_vec.reshape(3)
+    face_ax_min = np.nanmin(tri_ax, axis=1)
+    face_ax_max = np.nanmax(tri_ax, axis=1)
+
+    edge_lengths: list[float] = []
+    for fid in list(base)[:3000]:
+        pts = tri[int(fid)]
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            length = float(np.linalg.norm(pts[a] - pts[b]))
+            if np.isfinite(length) and length > 1.0e-12:
+                edge_lengths.append(length)
+    edge_scale = float(np.median(edge_lengths)) if edge_lengths else 1.0
+    axial_tol = max(0.045 * depth, 0.10 * radius, 4.0 * edge_scale, 0.35)
+    radial_tol = max(0.18 * radius, 6.0 * edge_scale, 0.55)
+
+    target: set[int] = set(base)
+    for fid in pool:
+        if fid < 0 or fid >= len(faces_arr):
+            continue
+        if not (np.isfinite(face_ax_min[fid]) and np.isfinite(face_ax_max[fid]) and np.isfinite(radial_cent[fid])):
+            continue
+        between = bool(face_ax_max[fid] >= -axial_tol and face_ax_min[fid] <= depth + axial_tol)
+        near_radius = bool(abs(float(radial_cent[fid]) - radius) <= radial_tol)
+        sidewall_normal = bool(float(normal_axis_abs[fid]) <= 0.75 and float(radial_normal_alignment[fid]) >= 0.20)
+        if between and near_radius and sidewall_normal:
+            target.add(int(fid))
+
+    return tuple(sorted(target)), {
+        "used": True,
+        "source": "candidate_two_opening_frame_full_depth_wall_target",
+        "base_face_count": int(len(base)),
+        "pool_face_count": int(len(pool)),
+        "target_face_count": int(len(target)),
+        "added_face_count": int(max(0, len(target) - len(base))),
+        "radius": float(radius),
+        "depth": float(depth),
+        "frame_source": str(frame.get("frame_source", frame.get("status", "candidate_owned_bore_frame"))),
+        "radial_tolerance": float(radial_tol),
+        "axial_tolerance": float(axial_tol),
+    }
+
 def _protected_loop_pair_from_selection(
     *,
     vertices: np.ndarray,
@@ -1587,6 +3284,74 @@ def _protected_loop_pair_from_selection(
 # -----------------------------------------------------------------------------
 
 
+def _small_boundary_seal_triangles_for_trial_mesh(
+    *,
+    source_faces: np.ndarray,
+    face_ids: tuple[int, ...],
+    generated_vertices: np.ndarray,
+    triangles: np.ndarray,
+    max_boundary_edges: int = 12,
+    max_loop_edges: int = 6,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Return conservative closure triangles for tiny damaged-bore residual holes.
+
+    This is not a general mesh repair and it is never used for clean candidates.
+    The caller only invokes it for damaged BORE rebuild trials after the normal
+    measured two-loop replacement still leaves a very small boundary.  Large or
+    open residual boundaries remain a rejection.
+    """
+
+    source_arr = np.asarray(source_faces, dtype=np.int64)[:, :3]
+    remove_mask = np.ones(len(source_arr), dtype=bool)
+    valid_faces = tuple(int(fid) for fid in tuple(face_ids or ()) if 0 <= int(fid) < len(source_arr))
+    if valid_faces:
+        remove_mask[np.asarray(valid_faces, dtype=np.int64)] = False
+    kept_faces = source_arr[remove_mask, :3].copy()
+    tri_arr = np.asarray(triangles, dtype=np.int64).reshape((-1, 3))
+    if tri_arr.size == 0:
+        return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "no_generated_triangles"}
+    output_faces = np.vstack([kept_faces, tri_arr])
+    boundary_edges = set(boundary_edges_for_face_patch(output_faces, range(len(output_faces))))
+    if not boundary_edges:
+        return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "already_closed"}
+    if len(boundary_edges) > int(max_boundary_edges):
+        return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "residual_boundary_too_large", "boundary_edge_count": int(len(boundary_edges))}
+
+    components = edge_loop_components(boundary_edges)
+    close_tris: list[tuple[int, int, int]] = []
+    loop_sizes: list[int] = []
+    for comp in components:
+        edges = {_edge_key(edge) for edge in tuple(comp or ())}
+        ordered = _order_closed_edge_loop_vertices(edges)
+        verts = tuple(int(v) for v in tuple(ordered.get("vertices", ()) or ()))
+        if not bool(ordered.get("closed", False)) or len(verts) < 3:
+            return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "residual_boundary_not_closed", "boundary_edge_count": int(len(boundary_edges))}
+        if len(verts) > int(max_loop_edges):
+            return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "residual_boundary_loop_too_large", "boundary_edge_count": int(len(boundary_edges)), "loop_vertex_count": int(len(verts))}
+        loop_sizes.append(int(len(verts)))
+        if len(verts) == 3:
+            close_tris.append((int(verts[0]), int(verts[1]), int(verts[2])))
+        else:
+            anchor = int(verts[0])
+            for i in range(1, len(verts) - 1):
+                close_tris.append((anchor, int(verts[i]), int(verts[i + 1])))
+
+    if not close_tris:
+        return np.zeros((0, 3), dtype=np.int64), {"used": False, "reason": "no_closure_triangles_created"}
+    out = np.asarray(close_tris, dtype=np.int64).reshape((-1, 3))
+    sealed_faces = np.vstack([output_faces, out])
+    after_edges = int(len(boundary_edges_for_face_patch(sealed_faces, range(len(sealed_faces)))))
+    return out, {
+        "used": True,
+        "reason": "tiny_residual_boundary_closed_for_damaged_bore_trial",
+        "boundary_edge_count_before": int(len(boundary_edges)),
+        "boundary_edge_count_after_seal": int(after_edges),
+        "closure_triangle_count": int(len(out)),
+        "closed_loop_count": int(len(loop_sizes)),
+        "closed_loop_vertex_counts": tuple(int(v) for v in loop_sizes),
+    }
+
+
 def _trial_rebuild(
     *,
     vertices: np.ndarray,
@@ -1607,15 +3372,103 @@ def _trial_rebuild(
     if generated_vertices.size:
         output_vertices = np.vstack([output_vertices, generated_vertices])
     output_faces = np.vstack([kept_faces, triangles])
+    boundary_before = _boundary_edge_count(source_faces)
     boundary_count = _boundary_edge_count(output_faces)
     trial_mesh = trimesh.Trimesh(vertices=output_vertices, faces=output_faces, process=False)
+    boundary_delta = int(boundary_count) - int(boundary_before)
     return {
+        "boundary_edge_count_before": int(boundary_before),
         "boundary_edge_count_after": int(boundary_count),
+        "boundary_edge_count_delta": int(boundary_delta),
         "watertight_after": bool(getattr(trial_mesh, "is_watertight", False)),
         "kept_face_count": int(len(kept_faces)),
         "after_face_count": int(len(output_faces)),
         "after_vertex_count": int(len(output_vertices)),
     }
+
+
+
+def _int_preserve_zero(value: object, default: int = -1) -> int:
+    """Coerce diagnostics to int without treating 0 as missing.
+
+    Rebuild diagnostics legitimately use zero for success states, for example
+    generated_boundary_generated_vertex_edge_count=0.  Do not use
+    ``value or fallback`` here because it turns a valid zero into the fallback.
+    """
+
+    if value is None:
+        return int(default)
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except Exception:
+        return int(default)
+
+def _trial_accepts_for_context(*, context: RebuildCandidateContext, trial: Mapping[str, object], plan: QuadPlan) -> bool:
+    """Return whether a trial replacement is acceptable for this feature type.
+
+    Global watertightness remains the strongest success condition.  For imported
+    meshes that are already globally open, an accepted local feature CandidateData
+    may still be valid when the replacement exactly preserves the deleted patch
+    boundary and does not add new boundary edges.  v83 extends the v80 local
+    CHAMFER rule to accepted BORE wall candidates, because the v82 clean bore
+    test proved the exact same local-topology contract: patchB == genB, no
+    missing/extra boundary edges, and boundary_edge_count_after <= before.
+
+    _trial_accepts_preserves_zero_boundary_counts_v85; local_bore_wall_rebuild_acceptance_v85 is topology acceptance only; it does
+    not loosen Recognition, DeletePatchProposal ownership, or boundary-loop
+    matching.
+    """
+
+    # v85: preserve real zero counts.  The previous code used
+    # ``int(value or -1)``, which converted boundary_edge_count_after=0 into
+    # -1.  Damaged-bore full-depth trials can legitimately return
+    # after=0, watertight_after=True after swallowing internal defect
+    # boundary loops, so zero must remain zero for acceptance.
+    after_raw = trial.get("boundary_edge_count_after", -1)
+    before_raw = trial.get("boundary_edge_count_before", -1)
+    after = int(after_raw if after_raw is not None else -1)
+    before = int(before_raw if before_raw is not None else -1)
+    if after == 0 and bool(trial.get("watertight_after", False)):
+        return True
+
+    entity = str(getattr(context, "entity_type", "") or "").strip().lower()
+    if entity in {"chamfer", "borehole", "pocket", "circular_pocket"}:
+        diag = dict(getattr(plan, "diagnostics", {}) or {})
+        boundary_match = bool(diag.get("boundary_match_exact", False))
+        missing = int(diag.get("missing_patch_boundary_edge_count", 1) or 0)
+        extra = int(diag.get("extra_generated_boundary_edge_count", 1) or 0)
+        patch_edges = int(diag.get("patch_boundary_edge_count", 0) or 0)
+        generated_edges = _int_preserve_zero(diag.get("generated_boundary_edge_count", -1), -1)
+        generated_original_boundary = _int_preserve_zero(diag.get("generated_boundary_original_vertex_edge_count", -1), -1)
+        generated_new_boundary = _int_preserve_zero(diag.get("generated_boundary_generated_vertex_edge_count", -1), -1)
+        candidate_owned_patch = bool(getattr(context, "candidate_from_component_engine", False)) and bool(getattr(context, "candidate_has_preview_face_patch", False))
+        local_boundary_preserved = bool(
+            boundary_match
+            and missing == 0
+            and extra == 0
+            and patch_edges > 0
+            and generated_edges == patch_edges
+            and before >= 0
+            and after <= before
+        )
+        if entity == "chamfer" and local_boundary_preserved:
+            return True
+        if entity == "borehole" and candidate_owned_patch and local_boundary_preserved:
+            return True
+        if entity in {"pocket", "circular_pocket"}:
+            # POCKET v98 local acceptance: the pocket side-wall delete patch is
+            # a measured two-rim sleeve between the opening loop and the floor
+            # perimeter.  On user meshes that are already globally open, the
+            # whole mesh may remain non-watertight even when the local replacement
+            # is exact.  Accept only the strict local topology contract: the
+            # generated surface must reproduce every original patch boundary edge,
+            # add no generated-vertex boundary edges, and not increase the global
+            # boundary count.  Floor faces are preserved by CandidateData/rebuild
+            # input; this does not authorize broad RegionData deletion.
+            pocket_boundary_is_original_only = bool(generated_original_boundary == patch_edges and generated_new_boundary == 0)
+            if candidate_owned_patch and local_boundary_preserved and pocket_boundary_is_original_only:
+                return True
+    return False
 
 
 def _apply_rebuild(
@@ -1751,7 +3604,9 @@ def _attempt_summary(
         "transition_ring_vertex_count": int(plan_diag.get("transition_ring_vertex_count", 0) or 0),
         "axial_separation": float(attempt.axial_separation),
         "min_required_axial_separation": float(attempt.min_required_axial_separation),
+        "boundary_edge_count_before": int(trial.get("boundary_edge_count_before", -1) if trial.get("boundary_edge_count_before", -1) is not None else -1),
         "boundary_edge_count_after": int(trial.get("boundary_edge_count_after", 10**9 if error else -1)),
+        "boundary_edge_count_delta": int(trial.get("boundary_edge_count_delta", 10**9 if error else 0)),
         "watertight_after": bool(trial.get("watertight_after", False)),
         "boundary_match_exact": bool(plan_diag.get("boundary_match_exact", False)),
         "patch_boundary_edge_count": int(plan_diag.get("patch_boundary_edge_count", -1) if plan_diag.get("patch_boundary_edge_count", -1) is not None else -1),
@@ -1764,6 +3619,10 @@ def _attempt_summary(
         "patch_edges_generated_count_histogram": tuple(plan_diag.get("patch_edges_generated_count_histogram", ()) or ()),
         "sample_missing_patch_boundary_edges": tuple(plan_diag.get("sample_missing_patch_boundary_edges", ()) or ()),
         "sample_extra_generated_boundary_edges": tuple(plan_diag.get("sample_extra_generated_boundary_edges", ()) or ()),
+        "damaged_bore_small_boundary_seal_used": bool(plan_diag.get("damaged_bore_small_boundary_seal_used", False)),
+        "damaged_bore_small_boundary_seal_added_triangle_count": int(plan_diag.get("damaged_bore_small_boundary_seal_added_triangle_count", 0) or 0),
+        "damaged_bore_small_boundary_seal_boundary_edge_count_before": int(plan_diag.get("damaged_bore_small_boundary_seal_boundary_edge_count_before", -1) if plan_diag.get("damaged_bore_small_boundary_seal_boundary_edge_count_before", -1) is not None else -1),
+        "damaged_bore_small_boundary_seal_boundary_edge_count_after_seal": int(plan_diag.get("damaged_bore_small_boundary_seal_boundary_edge_count_after_seal", -1) if plan_diag.get("damaged_bore_small_boundary_seal_boundary_edge_count_after_seal", -1) is not None else -1),
         "error": str(error),
     }
 
@@ -1805,7 +3664,9 @@ def _format_failure_message(
         f"best_unequal_loop_transition_allowed={best_failure.get('unequal_loop_transition_allowed', '-')}; "
         f"best_unequal_loop_transition_used={best_failure.get('unequal_loop_transition_used', '-')}; "
         f"best_transition_drop_quad_count={best_failure.get('transition_drop_quad_count', '-')}; "
+        f"best_boundary_edge_count_before={best_failure.get('boundary_edge_count_before', '-')}; "
         f"best_boundary_edge_count_after={best_failure.get('boundary_edge_count_after', '-')}; "
+        f"best_boundary_edge_count_delta={best_failure.get('boundary_edge_count_delta', '-')}; "
         f"best_watertight_after={best_failure.get('watertight_after', '-')}; "
         f"best_boundary_match_exact={best_failure.get('boundary_match_exact', '-')}; "
         f"best_patch_boundary_edge_count={best_failure.get('patch_boundary_edge_count', '-')}; "
@@ -1841,7 +3702,7 @@ def _compact_attempt_summaries(attempt_summaries: Iterable[Mapping[str, object]]
         parts.append(
             (
                 "#%s %s target=%s faces=%s loops=%s exact=%s protected=%s "
-                "v=%s/%s delta=%s unequal=%s used=%s after_edges=%s watertight=%s "
+                "v=%s/%s delta=%s unequal=%s used=%s before_edges=%s after_edges=%s edge_delta=%s watertight=%s "
                 "boundary_match=%s patchB=%s genB=%s genOrigB=%s genNewB=%s sharedB=%s missingB=%s extraB=%s patchHist=%s%s"
             )
             % (
@@ -1857,7 +3718,9 @@ def _compact_attempt_summaries(attempt_summaries: Iterable[Mapping[str, object]]
                 raw.get("boundary_loop_vertex_count_delta", "?"),
                 raw.get("unequal_loop_transition_allowed", "?"),
                 raw.get("unequal_loop_transition_used", "?"),
+                raw.get("boundary_edge_count_before", "?"),
                 raw.get("boundary_edge_count_after", "?"),
+                raw.get("boundary_edge_count_delta", "?"),
                 raw.get("watertight_after", "?"),
                 raw.get("boundary_match_exact", "?"),
                 raw.get("patch_boundary_edge_count", "?"),

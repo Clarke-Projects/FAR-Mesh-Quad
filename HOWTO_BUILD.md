@@ -1,6 +1,8 @@
-## Clean Clone and Native Package Build
+# FAR MESH Quad — Advanced Manual Native Package Build
 
-This procedure builds the native no-venv FAR MESH Quad package directly from a clean GitHub clone.
+This is the advanced/manual package-build procedure for maintainers. For normal public installation from a clean clone, use `HOW_TO_INSTALL.md` and the source installer script.
+
+This manual procedure builds the native no-venv FAR MESH Quad package directly from a clean GitHub clone and then installs the produced package with `pacman -U`.
 
 Validated target:
 
@@ -80,20 +82,20 @@ bash build-local-package.sh
 Expected package output:
 
 ```text
-far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+far-mesh-quad-native-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 A successful build ends with output similar to:
 
 ```text
 Package build complete:
-far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+far-mesh-quad-native-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 ### 5. Install the package
 
 ```bash
-sudo pacman -U far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U far-mesh-quad-native-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 The package installs to:
@@ -162,7 +164,7 @@ WGPU startup: PASS
 Validated package result:
 
 ```text
-far-mesh-quad-native-0.1.0-1-x86_64.pkg.tar.zst
+far-mesh-quad-native-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 Validated installed package size:
@@ -170,6 +172,16 @@ Validated installed package size:
 ```text
 approximately 34 MiB
 ```
+
+### Relationship to HOW_TO_INSTALL.md
+
+`HOW_TO_INSTALL.md` is the primary user-facing install guide. It runs the higher-level source installer:
+
+```bash
+bash packaging/install/install_far_mesh_quad.sh --target cachyos --yes
+```
+
+This document remains useful when you specifically want to test the lower-level package build path.
 
 ### Notes
 
