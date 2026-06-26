@@ -1,15 +1,14 @@
 """Typed Bore data contracts.
 
 These dataclasses are deliberately small and serializable.  They mark the
-architecture boundary used by the Bore folder revisit:
+architecture boundary used by the BoreTool semantic pipeline:
 
     RegionData -> CandidateData -> DeletePatchProposal -> RebuildResult
 
 No class in this module performs feature recognition, topology repair, mesh
 mutation, or parameter fitting.  The classes only make ownership explicit so
-region selection, recognition, UI rows and rebuild cannot silently reinterpret
-one another's dictionaries.
-
+region selection, recognition, UI rows, rebuild-target policy, and rebuild
+cannot silently reinterpret one another's dictionaries.
 """
 
 from __future__ import annotations
@@ -130,6 +129,37 @@ class FeatureRelationshipKind(str, Enum):
     POCKET_CONTAINS_BORE_OPENING = "pocket_contains_bore_opening"
 
 
+class MeshRealizationKind(str, Enum):
+    """How a physical opening appears in this mesh instance.
+
+    This is evidence-acquisition vocabulary only.  It does not name a feature
+    family and does not authorize candidate promotion or rebuild.
+    """
+
+    TOPOLOGY_CLOSED_LOOP = "topology_closed_loop"
+    SPARSE_POLYGONAL = "sparse_polygonal"
+    VIRTUAL_CONTOUR_SUPPORT = "virtual_contour_support"
+    CONTAMINATED_EDGE_CLOUD = "contaminated_edge_cloud"
+    BROKEN_PARTIAL_SUPPORT = "broken_partial_support"
+    UNKNOWN = "unknown"
+
+
+class OpeningProfileKind(str, Enum):
+    """Footprint-shape evidence for an opening.
+
+    These values describe the footprint evidence.  Recognition may later test a
+    physical BORE/POCKET/HEX_POCKET model against this evidence, but the profile
+    kind itself is not feature identity.
+    """
+
+    CIRCULAR = "circular"
+    POLYGONAL = "polygonal"
+    HEX_LIKE = "hex_like"
+    SLOT_LIKE = "slot_like"
+    ELLIPSE_LIKE = "ellipse_like"
+    UNKNOWN = "unknown"
+
+
 def enum_value(value: object) -> str:
     """Return a stable public string for enum-like values."""
 
@@ -199,6 +229,12 @@ class FeaturePrimitiveData:
     axis: Vector3 | None = None
     radius: float | None = None
     diameter: float | None = None
+    radius_min: float | None = None
+    radius_max: float | None = None
+    diameter_min: float | None = None
+    diameter_max: float | None = None
+    radial_spread: float | None = None
+    radial_spread_ratio: float | None = None
     depth: float | None = None
     confidence: float = 0.0
     face_ids: tuple[int, ...] = ()
@@ -215,6 +251,14 @@ class FeaturePrimitiveData:
             "axis": self.axis,
             "radius": self.radius,
             "diameter": self.diameter,
+            "radius_min": self.radius_min,
+            "radius_nominal": self.radius,
+            "radius_max": self.radius_max,
+            "diameter_min": self.diameter_min,
+            "diameter_nominal": self.diameter,
+            "diameter_max": self.diameter_max,
+            "radial_spread": self.radial_spread,
+            "radial_spread_ratio": self.radial_spread_ratio,
             "depth": self.depth,
             "confidence": float(self.confidence),
             "face_ids": tuple(int(v) for v in self.face_ids),
@@ -355,6 +399,150 @@ class FeatureEvidenceLedger:
             "primitive_axis": self.primitive_axis,
             "primitive_radius": self.primitive_radius,
             "primitive_depth": self.primitive_depth,
+            "diagnostics": dict(self.diagnostics or {}),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MeshRealizationAssessment:
+    """Evidence-only assessment of how a mesh realizes an opening.
+
+    This object lives between RegionData and Recognition.  It says whether the
+    mesh evidence looks like a clean loop, sparse polygon, virtual contour
+    support, or contaminated cloud.  It deliberately does not assign feature
+    identity, surface ownership, CandidateData actionability, or rebuild scope.
+    """
+
+    realization_kind: MeshRealizationKind | str = MeshRealizationKind.UNKNOWN
+    topology_quality: float = 0.0
+    edge_fragmentation: float = 0.0
+    closed_loop_quality: float = 0.0
+    polygonality: float = 0.0
+    pollution_score: float = 0.0
+    angular_support_quality: float = 0.0
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contract_type": "mesh_realization_assessment",
+            "semantic_stage": "mesh_realization_translation_evidence_only",
+            "realization_kind": enum_value(self.realization_kind),
+            "topology_quality": float(self.topology_quality),
+            "edge_fragmentation": float(self.edge_fragmentation),
+            "closed_loop_quality": float(self.closed_loop_quality),
+            "polygonality": float(self.polygonality),
+            "pollution_score": float(self.pollution_score),
+            "angular_support_quality": float(self.angular_support_quality),
+            "not_feature_identity": True,
+            "not_surface_ownership": True,
+            "not_rebuild_authority": True,
+            "diagnostics": dict(self.diagnostics or {}),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningFootprintAuthority:
+    """Canonical evidence object for a selected opening footprint.
+
+    A good mesh may populate this from a true topological loop.  A coarse mesh
+    may populate it from sparse polygonal support or a virtual contour.  The
+    contract is the same in both cases, so downstream Recognition can remain
+    semantic instead of becoming mesh-type-specific.
+    """
+
+    source: str = "mesh_realization.opening_footprint_provider"
+    profile_kind: OpeningProfileKind | str = OpeningProfileKind.UNKNOWN
+    center: Vector3 | None = None
+    axis: Vector3 | None = None
+    radius_min: float | None = None
+    radius_nominal: float | None = None
+    radius_max: float | None = None
+    diameter_min: float | None = None
+    diameter_nominal: float | None = None
+    diameter_max: float | None = None
+    radial_spread: float | None = None
+    radial_spread_ratio: float | None = None
+    support_edge_ids: tuple[int, ...] = ()
+    support_face_ids: tuple[int, ...] = ()
+    virtual_contour_points: tuple[Vector3, ...] = ()
+    angular_coverage: float = 0.0
+    max_angular_gap_degrees: float = 360.0
+    estimated_segment_count: int = 0
+    expected_polygon_min_max_ratio: float | None = None
+    observed_min_max_ratio: float | None = None
+    polygon_model_agreement: bool = False
+    confidence: float = 0.0
+    contamination_flags: tuple[str, ...] = ()
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contract_type": "opening_footprint_authority",
+            "semantic_stage": "canonical_opening_footprint_evidence",
+            "source": str(self.source),
+            "profile_kind": enum_value(self.profile_kind),
+            "center": self.center,
+            "axis": self.axis,
+            "radius_min": self.radius_min,
+            "radius_nominal": self.radius_nominal,
+            "radius_max": self.radius_max,
+            "diameter_min": self.diameter_min,
+            "diameter_nominal": self.diameter_nominal,
+            "diameter_max": self.diameter_max,
+            "radial_spread": self.radial_spread,
+            "radial_spread_ratio": self.radial_spread_ratio,
+            "support_edge_ids": tuple(int(v) for v in self.support_edge_ids),
+            "support_edge_count": int(len(self.support_edge_ids)),
+            "support_face_ids": tuple(int(v) for v in self.support_face_ids),
+            "support_face_count": int(len(self.support_face_ids)),
+            "virtual_contour_points": self.virtual_contour_points,
+            "virtual_contour_point_count": int(len(self.virtual_contour_points)),
+            "angular_coverage": float(self.angular_coverage),
+            "max_angular_gap_degrees": float(self.max_angular_gap_degrees),
+            "estimated_segment_count": int(self.estimated_segment_count),
+            "expected_polygon_min_max_ratio": self.expected_polygon_min_max_ratio,
+            "observed_min_max_ratio": self.observed_min_max_ratio,
+            "polygon_model_agreement": bool(self.polygon_model_agreement),
+            "confidence": float(self.confidence),
+            "contamination_flags": tuple(str(v) for v in self.contamination_flags),
+            "not_feature_identity": True,
+            "not_surface_ownership": True,
+            "not_rebuild_authority": True,
+            "diagnostics": dict(self.diagnostics or {}),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningEvidenceLedgerData:
+    """Opening-level mesh-realization evidence ledger.
+
+    This is the mesh-native counterpart of X1's evidence ledger for the selected
+    opening only.  It is consumed as evidence by Recognition; it is not
+    CandidateData and not DeletePatchProposal.
+    """
+
+    raw_edge_ids: tuple[int, ...] = ()
+    selected_authority: OpeningFootprintAuthority = field(default_factory=OpeningFootprintAuthority)
+    mesh_realization_assessment: MeshRealizationAssessment = field(default_factory=MeshRealizationAssessment)
+    provider_observations: tuple[Mapping[str, object], ...] = ()
+    rejected_edge_ids: tuple[int, ...] = ()
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contract_type": "opening_evidence_ledger",
+            "semantic_stage": "mesh_realization_evidence_ledger",
+            "raw_edge_ids": tuple(int(v) for v in self.raw_edge_ids),
+            "raw_edge_count": int(len(self.raw_edge_ids)),
+            "selected_authority": self.selected_authority.to_dict(),
+            "mesh_realization_assessment": self.mesh_realization_assessment.to_dict(),
+            "provider_observations": tuple(dict(v) for v in self.provider_observations),
+            "provider_observation_count": int(len(self.provider_observations)),
+            "rejected_edge_ids": tuple(int(v) for v in self.rejected_edge_ids),
+            "rejected_edge_count": int(len(self.rejected_edge_ids)),
+            "not_feature_identity": True,
+            "not_surface_ownership": True,
+            "not_rebuild_authority": True,
             "diagnostics": dict(self.diagnostics or {}),
         }
 

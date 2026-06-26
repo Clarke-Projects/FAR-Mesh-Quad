@@ -33,6 +33,11 @@ class SelectionController(QObject):
     ------------------
     - session = intended state owned by the controller
     - state   = actual current selection snapshot, usually synced from viewport
+    - edge_pick_seed = raw clicked primitive evidence for tool routing
+
+    This controller does not classify features.  It prepares selection sessions,
+    preserves seed metadata, and hands stable evidence snapshots to tools such
+    as BoreTool.
 
     Important migration rule
     ------------------------
@@ -155,9 +160,10 @@ class SelectionController(QObject):
     ) -> None:
         """Store and push the generic core edge-region strategy.
 
-        This is deliberately not Bore logic.  It is only selection intent:
-        normal edge tools use ``safe``; Bore tools can request ``bore_rim``.
-        The viewport only forwards this string to core.selection_edges.
+        This is deliberately not Recognition or Bore ownership logic.  It is
+        only selection intent: normal edge tools use ``safe``; Bore tools can
+        request ``bore_rim``.  The viewport only forwards this string to
+        ``core.selection_edges``.
         """
 
         value = str(strategy or "safe").strip().lower()
@@ -188,7 +194,9 @@ class SelectionController(QObject):
         asked to preserve them.
 
         Tools such as BoreTool should call this instead of reaching directly into
-        raw viewport selection mode and edge-region strategy methods.
+        raw viewport selection mode and edge-region strategy methods.  The
+        returned edges are still selection evidence; feature meaning starts in
+        the tool/Region Select pipeline.
         """
 
         self.sync_from_viewport(reason=reason)
@@ -238,6 +246,21 @@ class SelectionController(QObject):
         self.sync_from_viewport(reason=reason)
         self.snapshot_emitted.emit(self.snapshot(reason))
         return tuple(int(v) for v in self._state.selected_edge_ids)
+
+    def edge_pick_seed_snapshot(
+        self,
+        *,
+        reason: str = "edge_pick_seed_snapshot",
+    ) -> dict[str, Any]:
+        """Return raw clicked edge/pick metadata for tool evidence routing.
+
+        This seed is not a feature classification.  It is the exact primitive
+        the user clicked before live edge-region expansion.
+        """
+
+        self.sync_from_viewport(reason=reason)
+        self.snapshot_emitted.emit(self.snapshot(reason))
+        return dict(self._state.edge_pick_seed or {})
 
     def clear_after_mesh_replacement(
         self,
@@ -655,6 +678,74 @@ class SelectionController(QObject):
         if push:
             self.push_session_to_viewport(reason=reason)
 
+    def _normalize_edge_pick_seed_payload(self, raw: object) -> dict[str, Any]:
+        """Return safe raw-click seed metadata from a viewport selection payload."""
+
+        if not isinstance(raw, dict):
+            return {}
+
+        out: dict[str, Any] = {}
+
+        def _tuple_ints(value: object) -> tuple[int, ...]:
+            try:
+                return tuple(int(v) for v in tuple(value or ()))  # type: ignore[arg-type]
+            except Exception:
+                return ()
+
+        def _tuple_floats3(value: object) -> tuple[float, float, float] | None:
+            try:
+                seq = tuple(float(v) for v in tuple(value or ()))  # type: ignore[arg-type]
+            except Exception:
+                return None
+            if len(seq) < 3:
+                return None
+            return (float(seq[0]), float(seq[1]), float(seq[2]))
+
+        for key in ("seed_edge_id", "clicked_edge_id", "edge_id"):
+            if key in raw:
+                try:
+                    out["seed_edge_id"] = int(raw[key])
+                    break
+                except Exception:
+                    pass
+        for key in ("seed_face_id", "clicked_face_id", "face_id"):
+            if key in raw:
+                try:
+                    out["seed_face_id"] = int(raw[key])
+                    break
+                except Exception:
+                    pass
+
+        out["seed_edge_vertex_ids"] = _tuple_ints(
+            raw.get("seed_edge_vertex_ids", raw.get("edge_vertex_ids", ()))
+        )
+        out["seed_adjacent_face_ids"] = _tuple_ints(
+            raw.get("seed_adjacent_face_ids", raw.get("adjacent_face_ids", ()))
+        )
+        point = _tuple_floats3(raw.get("seed_pick_point", raw.get("picked_world_pos", raw.get("world_pos"))))
+        if point is not None:
+            out["seed_pick_point"] = point
+
+        for key in (
+            "selection_origin",
+            "edge_region_strategy",
+            "backend",
+            "modifiers",
+            "brush_drag",
+        ):
+            if key in raw:
+                value = raw[key]
+                if isinstance(value, (tuple, list)):
+                    out[key] = tuple(value)
+                elif isinstance(value, (str, int, float, bool)) or value is None:
+                    out[key] = value
+        try:
+            out["expanded_edge_count"] = int(raw.get("expanded_edge_count", raw.get("selected_edge_count_after_pick", 0)) or 0)
+        except Exception:
+            pass
+        out["metadata_contract"] = "viewport_click_seed_primitive_v143"
+        return out
+
     # ------------------------------------------------------------------
     # viewport sync
     # ------------------------------------------------------------------
@@ -691,6 +782,10 @@ class SelectionController(QObject):
             )
         )
 
+        edge_pick_seed = self._normalize_edge_pick_seed_payload(
+            state_dict.get("edge_pick_seed", state_dict.get("last_edge_pick_seed", {}))
+        )
+
         # If the backend reports NONE but still has actual ids, derive a more useful actual mode.
         if actual_mode is SelectionMode.NONE:
             if selected_faces:
@@ -710,6 +805,7 @@ class SelectionController(QObject):
             selected_edge_ids=selected_edges,
             selected_mesh_ids=selected_mesh,
             brush_enabled=brush_enabled,
+            edge_pick_seed=edge_pick_seed,
             revision=self._state.revision + 1,
         )
 
@@ -967,6 +1063,7 @@ class SelectionController(QObject):
             "face_ids": list(self._state.selected_face_ids),
             "vertex_ids": list(self._state.selected_vertex_ids),
             "edge_ids": list(self._state.selected_edge_ids),
+            "edge_pick_seed": dict(self._state.edge_pick_seed or {}),
             "mesh_ids": list(self._state.selected_mesh_ids),
             "brush_enabled": bool(self._state.brush_enabled),
             "interaction_style": self._state.interaction_style.value,

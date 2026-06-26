@@ -35,7 +35,7 @@ bash packaging/install/install_far_mesh_quad.sh --target cachyos --yes --system-
 10. Installs `/usr/bin/far-mesh-quad-native`.
 11. Installs the desktop file and icon.
 12. Installs the full license bundle to `/usr/share/licenses/far-mesh-quad-native`.
-13. Runs runtime validation.
+13. Runs runtime validation, including the v0.1.3 folderized BoreTool import probe.
 
 ## Modes
 
@@ -70,6 +70,16 @@ Optional inputs such as `requirements/` and `pyproject.toml` are copied when pre
 
 Do not stage virtual environments, `_staging` outputs, package `pkg/`/`src/` build directories, Python caches, or local development scratch data.
 
+For v0.1.3 the staged payload is also validated for the folderized BoreTool layout:
+
+```text
+far_mesh/core/bore/selection/
+far_mesh/core/bore/recognition/
+far_mesh/core/bore/rebuild/
+```
+
+The validation imports the public `far_mesh.core.bore` API plus direct imports from `selection.region_select`, `selection.mesh_realization`, `recognition.recognition`, `recognition.recognition_component_engine`, `rebuild.rebuild`, and `rebuild.rebuild_inventory`.
+
 ## Compiler-file safety
 
 The installer does not mutate `/usr/bin/gcc-14` or `/usr/bin/g++-14`.
@@ -87,6 +97,10 @@ OK pylinalg
 OK pygfx
 FAR MESH native dependency import probe OK
 OK far_mesh import from installed app root /opt/far-mesh-quad-native/far_mesh/__init__.py
+OK folderized Bore public API RebuildResult RebuildTargetPatch
+OK folderized Bore selection select_region_data
+OK folderized Bore recognition recognize_bore_region_selection component_engine_feature_candidates
+OK folderized Bore rebuild delete_and_rebuild_candidate_region
 [far-mesh-install] Validation complete. Launch with: /usr/bin/far-mesh-quad-native
 ```
 
@@ -95,3 +109,10 @@ Then launch:
 ```bash
 far-mesh-quad-native
 ```
+
+
+## v0.1.3 BoreTool folderization validation
+
+Version 0.1.3 prepares the native installer for the folderized BoreTool package layout. The installer and staging helper now fail early if stale imports such as `far_mesh.core.bore.recognition_component_engine` remain after the move to `far_mesh.core.bore.recognition.recognition_component_engine`.
+
+This is a packaging validation change only. It does not change BoreTool geometry, recognition, rebuild behavior, or the native wrapper model.

@@ -1,10 +1,14 @@
 """Mesh-native Bore geometry helpers.
 
-This module is the FAR MESH mesh-native geometry engine for the Bore evidence
-model.  Measurements and fits are evidence for recognition, not final rebuild
-placement instructions.  The final rebuild
-uses measured patch boundaries in ``rebuild.py``.  This module only provides measurement primitives. Feature classification,
-local layer naming, and promotion live outside this module.
+This module is the FAR MESH mesh-native geometry engine for measurement
+primitives.  Measurements and fits are evidence for Recognition and Rebuild, but
+this module does not classify features, assign surface roles, construct rebuild
+targets, or mutate mesh topology.
+
+The final rebuild combines CandidateData, measured constraints, protected patch
+boundaries, and rebuild policy in ``rebuild.py``.  Geometry helpers only provide
+well-scoped numeric primitives such as plane fits, ring fits, axes, radii,
+robust medians, and diagnostic measurements.
 """
 
 from __future__ import annotations

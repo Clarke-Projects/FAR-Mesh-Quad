@@ -15,13 +15,13 @@ from typing import Mapping
 
 import numpy as np
 
-from .geometry import (
+from ..geometry import (
     canonical_axis,
     describe_boundary_loop_stack_geometry,
     measure_feature_patch_geometry,
     to_vector3,
 )
-from .measure import (
+from ..measure import (
     BoreOpeningMeasurement,
     measure_bore_opening_candidates,
     measure_bore_opening_component_candidates,
@@ -31,7 +31,7 @@ from .recognition_component_engine import (
     component_engine_feature_candidates,
     recognition_result_dict_from_component_features,
 )
-from .types import EvidenceKind, FeatureFamily, RecognitionStage, tuple_edges, tuple_ints
+from ..types import EvidenceKind, FeatureFamily, RecognitionStage, tuple_edges, tuple_ints
 
 ACTIVE_CANDIDATE_AUTHORITY = "surface_component_classifier_v93_heuristic_role_scale_clamp_full_depth_wall_ownership"
 REGION_SELECT_FEATURE_AUTHORITY = False
@@ -188,6 +188,16 @@ def _opening_measurement_row(value: object, *, source: str, rank: int, input_edg
         "axis": to_vector3(getattr(value, "axis", (0.0, 0.0, 1.0))),
         "radius": float(getattr(value, "radius", 0.0) or 0.0),
         "diameter": float(getattr(value, "diameter", 0.0) or 0.0),
+        "radius_min": float(getattr(value, "radius_min", None) if getattr(value, "radius_min", None) is not None else getattr(value, "radius", 0.0) or 0.0),
+        "radius_nominal": float(getattr(value, "radius", 0.0) or 0.0),
+        "radius_max": float(getattr(value, "radius_max", None) if getattr(value, "radius_max", None) is not None else getattr(value, "radius", 0.0) or 0.0),
+        "diameter_min": float(getattr(value, "diameter_min", None) if getattr(value, "diameter_min", None) is not None else getattr(value, "diameter", 0.0) or 0.0),
+        "diameter_nominal": float(getattr(value, "diameter", 0.0) or 0.0),
+        "diameter_max": float(getattr(value, "diameter_max", None) if getattr(value, "diameter_max", None) is not None else getattr(value, "diameter", 0.0) or 0.0),
+        "radial_spread": float(getattr(value, "radial_spread", None) if getattr(value, "radial_spread", None) is not None else 0.0),
+        "radial_spread_ratio": float(getattr(value, "radial_spread_ratio", None) if getattr(value, "radial_spread_ratio", None) is not None else 0.0),
+        "coarse_polygonal": bool(getattr(value, "coarse_polygonal", False)),
+        "radial_envelope": dict(getattr(value, "radial_envelope", {}) or {}),
         "closed": bool(getattr(value, "closed", False)),
         "near_closed": bool(getattr(value, "near_closed", False)),
         "endpoint_gap_ratio": float(getattr(value, "endpoint_gap_ratio", 0.0) or 0.0),
@@ -302,6 +312,12 @@ def _selected_opening_measurement_audit(mesh: object, selected_edge_ids: tuple[i
     component_best = component_rows[0] if component_rows else {}
     if raw_best:
         out["raw_best_radius"] = float(raw_best.get("radius", 0.0) or 0.0)
+        out["raw_best_radius_min"] = float(raw_best.get("radius_min", raw_best.get("radius", 0.0)) or 0.0)
+        out["raw_best_radius_max"] = float(raw_best.get("radius_max", raw_best.get("radius", 0.0)) or 0.0)
+        out["raw_best_diameter_min"] = float(raw_best.get("diameter_min", raw_best.get("diameter", 0.0)) or 0.0)
+        out["raw_best_diameter_max"] = float(raw_best.get("diameter_max", raw_best.get("diameter", 0.0)) or 0.0)
+        out["raw_best_radial_spread_ratio"] = float(raw_best.get("radial_spread_ratio", 0.0) or 0.0)
+        out["raw_best_coarse_polygonal"] = bool(raw_best.get("coarse_polygonal", False))
         out["raw_best_confidence"] = float(raw_best.get("confidence", 0.0) or 0.0)
         out["raw_best_edge_count"] = int(raw_best.get("edge_count", 0) or 0)
         out["raw_best_component_strategy"] = str(raw_best.get("component_strategy", "") or "")
@@ -309,6 +325,12 @@ def _selected_opening_measurement_audit(mesh: object, selected_edge_ids: tuple[i
         out["raw_best_largest_component_fraction"] = float(raw_best.get("largest_component_fraction", 0.0) or 0.0)
     if rim_best:
         out["normalized_best_radius"] = float(rim_best.get("radius", 0.0) or 0.0)
+        out["normalized_best_radius_min"] = float(rim_best.get("radius_min", rim_best.get("radius", 0.0)) or 0.0)
+        out["normalized_best_radius_max"] = float(rim_best.get("radius_max", rim_best.get("radius", 0.0)) or 0.0)
+        out["normalized_best_diameter_min"] = float(rim_best.get("diameter_min", rim_best.get("diameter", 0.0)) or 0.0)
+        out["normalized_best_diameter_max"] = float(rim_best.get("diameter_max", rim_best.get("diameter", 0.0)) or 0.0)
+        out["normalized_best_radial_spread_ratio"] = float(rim_best.get("radial_spread_ratio", 0.0) or 0.0)
+        out["normalized_best_coarse_polygonal"] = bool(rim_best.get("coarse_polygonal", False))
         out["normalized_best_confidence"] = float(rim_best.get("confidence", 0.0) or 0.0)
         out["normalized_best_edge_count"] = int(rim_best.get("edge_count", 0) or 0)
         out["normalized_best_component_strategy"] = str(rim_best.get("component_strategy", "") or "")
@@ -316,6 +338,12 @@ def _selected_opening_measurement_audit(mesh: object, selected_edge_ids: tuple[i
         out["normalized_best_largest_component_fraction"] = float(rim_best.get("largest_component_fraction", 0.0) or 0.0)
     if component_best:
         out["raw_component_best_radius"] = float(component_best.get("radius", 0.0) or 0.0)
+        out["raw_component_best_radius_min"] = float(component_best.get("radius_min", component_best.get("radius", 0.0)) or 0.0)
+        out["raw_component_best_radius_max"] = float(component_best.get("radius_max", component_best.get("radius", 0.0)) or 0.0)
+        out["raw_component_best_diameter_min"] = float(component_best.get("diameter_min", component_best.get("diameter", 0.0)) or 0.0)
+        out["raw_component_best_diameter_max"] = float(component_best.get("diameter_max", component_best.get("diameter", 0.0)) or 0.0)
+        out["raw_component_best_radial_spread_ratio"] = float(component_best.get("radial_spread_ratio", 0.0) or 0.0)
+        out["raw_component_best_coarse_polygonal"] = bool(component_best.get("coarse_polygonal", False))
         out["raw_component_best_confidence"] = float(component_best.get("confidence", 0.0) or 0.0)
         out["raw_component_best_edge_count"] = int(component_best.get("edge_count", 0) or 0)
         out["raw_component_best_component_strategy"] = str(component_best.get("component_strategy", "") or "")
@@ -434,6 +462,15 @@ def _opening_from_resolved_frame(frame: Mapping[str, object]) -> BoreOpeningMeas
     radius = _finite_float_value(frame.get("radius", candidate.get("radius", 0.0)), 0.0)
     if radius <= 1.0e-12:
         return None
+    radius_min = _finite_float_value(frame.get("radius_min", candidate.get("radius_min", radius)), radius)
+    radius_max = _finite_float_value(frame.get("radius_max", candidate.get("radius_max", radius)), radius)
+    diameter_min = _finite_float_value(frame.get("diameter_min", candidate.get("diameter_min", 2.0 * radius_min)), 2.0 * radius_min)
+    diameter_max = _finite_float_value(frame.get("diameter_max", candidate.get("diameter_max", 2.0 * radius_max)), 2.0 * radius_max)
+    radial_spread = _finite_float_value(frame.get("radial_spread", candidate.get("radial_spread", max(0.0, radius_max - radius_min))), max(0.0, radius_max - radius_min))
+    radial_spread_ratio = _finite_float_value(frame.get("radial_spread_ratio", candidate.get("radial_spread_ratio", radial_spread / max(radius, 1.0e-12))), radial_spread / max(radius, 1.0e-12))
+    radial_envelope = frame.get("radial_envelope", candidate.get("radial_envelope", {}))
+    if not isinstance(radial_envelope, Mapping):
+        radial_envelope = {}
     center = tuple(float(v) for v in tuple(frame.get("center", candidate.get("center", (0.0, 0.0, 0.0))))[:3])
     axis = tuple(float(v) for v in tuple(frame.get("axis", candidate.get("axis", (0.0, 0.0, 1.0))))[:3])
     edge_count = int(frame.get("expanded_edge_count", candidate.get("edge_count", len(edge_ids))) or len(edge_ids))
@@ -460,6 +497,14 @@ def _opening_from_resolved_frame(frame: Mapping[str, object]) -> BoreOpeningMeas
         radius_mad=_finite_float_value(candidate.get("radius_mad", 0.0), 0.0),
         circularity=_finite_float_value(candidate.get("circularity", 0.0), 0.0),
         confidence=_finite_float_value(frame.get("confidence", candidate.get("confidence", 0.0)), 0.0),
+        radius_min=float(radius_min),
+        radius_max=float(radius_max),
+        diameter_min=float(diameter_min),
+        diameter_max=float(diameter_max),
+        radial_spread=float(radial_spread),
+        radial_spread_ratio=float(radial_spread_ratio),
+        coarse_polygonal=bool(frame.get("coarse_polygonal", candidate.get("coarse_polygonal", False))),
+        radial_envelope=dict(radial_envelope),
         diagnostics={
             **(dict(candidate.get("diagnostics", {}) or {}) if isinstance(candidate.get("diagnostics", {}), Mapping) else {}),
             "mode": "resolved_selected_opening_frame_rehydrated_for_two_opening_measurement",
@@ -467,6 +512,16 @@ def _opening_from_resolved_frame(frame: Mapping[str, object]) -> BoreOpeningMeas
             "source_resolver_status": str(frame.get("resolver_status", "")),
             "primary_edge_count": int(frame.get("primary_edge_count", 0) or 0),
             "expanded_edge_count": int(frame.get("expanded_edge_count", 0) or 0),
+            "radius_min": float(radius_min),
+            "radius_nominal": float(radius),
+            "radius_max": float(radius_max),
+            "diameter_min": float(diameter_min),
+            "diameter_nominal": float(2.0 * radius),
+            "diameter_max": float(diameter_max),
+            "radial_spread": float(radial_spread),
+            "radial_spread_ratio": float(radial_spread_ratio),
+            "coarse_polygonal": bool(frame.get("coarse_polygonal", candidate.get("coarse_polygonal", False))),
+            "radial_envelope": dict(radial_envelope),
         },
     )
 
@@ -510,6 +565,105 @@ def _measure_two_opening_frame_from_resolver(
         }
 
 
+def _audit_raw_opening_authority_override(audit: Mapping[str, object]) -> tuple[bool, dict[str, object]]:
+    """Decide whether raw/raw-component opening evidence must remain authority.
+
+    This is not a rebuild safety gate.  It chooses which measured opening frame
+    Recognition should treat as the selected opening.  The coarse-mesh failure
+    exposed by v148 is: live selection can now produce a clean small raw rim,
+    but Region Select normalization may expand that rim into a much noisier
+    broad/global opening.  When the audit already proves disagreement and the
+    raw measurement is cleaner, normalized candidates are diagnostics only.
+    """
+
+    def f(key: str, default: float = 0.0) -> float:
+        return _finite_float_value(audit.get(key, default), default)
+
+    audit_status = str(audit.get("audit_status", "") or "").strip().lower()
+    raw_agrees = bool(audit.get("raw_vs_normalized_measurement_agree", False))
+    collapsed = bool(audit.get("normalized_rim_collapse_suspected", False))
+
+    raw_count = int(audit.get("raw_candidate_count", 0) or 0)
+    raw_component_count = int(audit.get("raw_component_candidate_count", 0) or 0)
+    normalized_count = int(audit.get("normalized_candidate_count", 0) or 0)
+
+    raw_spread = f("raw_best_radial_spread_ratio", float("inf"))
+    raw_component_spread = f("raw_component_best_radial_spread_ratio", float("inf"))
+    normalized_spread = f("normalized_best_radial_spread_ratio", float("inf"))
+    best_raw_spread = min(raw_spread, raw_component_spread)
+
+    raw_conf = f("raw_best_confidence", 0.0)
+    raw_component_conf = f("raw_component_best_confidence", 0.0)
+    normalized_conf = f("normalized_best_confidence", 0.0)
+    best_raw_conf = max(raw_conf, raw_component_conf)
+
+    raw_radius = f("raw_best_radius", 0.0)
+    raw_component_radius = f("raw_component_best_radius", 0.0)
+    normalized_radius = f("normalized_best_radius", 0.0)
+
+    radius_delta_rel = f("raw_vs_normalized_radius_delta_rel", 999.0)
+    centerline_distance = f("raw_vs_normalized_centerline_distance", 999999.0)
+    axis_dot = f("raw_vs_normalized_axis_abs_dot", 0.0)
+
+    disagreement = bool(
+        collapsed
+        or audit_status == "opening_measurement_ambiguous_needs_review"
+        or not raw_agrees
+    )
+    raw_support_exists = bool((raw_count > 0 or raw_component_count > 0) and best_raw_conf > 0.0 and np.isfinite(best_raw_spread))
+    normalized_support_exists = bool(normalized_count > 0 and normalized_conf > 0.0 and np.isfinite(normalized_spread))
+
+    # A clean manually assisted/clicked-edge rim on a coarse mesh commonly has a
+    # very narrow raw radial envelope, while the normalized/global recovery has a
+    # wide envelope because it joined adjacent bands or another opening scale.
+    raw_is_much_cleaner = bool(
+        raw_support_exists
+        and normalized_support_exists
+        and best_raw_spread <= 0.08
+        and normalized_spread >= max(best_raw_spread * 4.0, 0.12)
+    )
+    raw_is_more_confident = bool(
+        raw_support_exists
+        and normalized_support_exists
+        and best_raw_conf >= normalized_conf + 0.10
+    )
+    raw_radius_is_plausible = bool(
+        max(raw_radius, raw_component_radius) > 1.0e-9
+        and normalized_radius > 1.0e-9
+    )
+
+    override = bool(
+        disagreement
+        and raw_support_exists
+        and raw_radius_is_plausible
+        and (raw_is_much_cleaner or raw_is_more_confident)
+    )
+
+    return override, {
+        "raw_opening_authority_override": bool(override),
+        "reason": "raw_measurement_cleaner_than_normalized_disagreement" if override else "normalized_not_overridden",
+        "audit_status": audit_status,
+        "raw_vs_normalized_measurement_agree": bool(raw_agrees),
+        "normalized_rim_collapse_suspected": bool(collapsed),
+        "raw_best_radius": float(raw_radius),
+        "raw_component_best_radius": float(raw_component_radius),
+        "normalized_best_radius": float(normalized_radius),
+        "raw_best_spread_ratio": float(raw_spread),
+        "raw_component_best_spread_ratio": float(raw_component_spread),
+        "normalized_best_spread_ratio": float(normalized_spread),
+        "raw_best_confidence": float(raw_conf),
+        "raw_component_best_confidence": float(raw_component_conf),
+        "normalized_best_confidence": float(normalized_conf),
+        "raw_vs_normalized_radius_delta_rel": float(radius_delta_rel),
+        "raw_vs_normalized_axis_abs_dot": float(axis_dot),
+        "raw_vs_normalized_centerline_distance": float(centerline_distance),
+        "raw_is_much_cleaner": bool(raw_is_much_cleaner),
+        "raw_is_more_confident": bool(raw_is_more_confident),
+        "semantic_stage": "opening_measurement_audit_to_selected_opening_authority_policy",
+        "not_rebuild_gate": True,
+    }
+
+
 def _selected_opening_frame_resolver(
     *,
     audit: Mapping[str, object],
@@ -521,21 +675,23 @@ def _selected_opening_frame_resolver(
 ) -> dict[str, object]:
     """Resolve the measured selected-opening frame from competing evidence.
 
-    v1.3.5 fixes the core messy-mesh failure: when the audit says the
-    normalized rim has collapsed or points to the wrong opening, the resolver is
-    forbidden to use normalized candidates or the RegionData frame as authority.
-    It must resolve from raw selected-edge component measurements.  RegionData is
-    still neutral AOI context; it is not allowed to decide the selected physical
-    opening on a polluted mesh.
+    v149 fixes the v148 follow-up failure: the live clicked-edge rim resolver
+    may produce a clean raw rim, but broad Region Select normalization can still
+    expand that rim into a noisier/global opening.  If the audit says raw and
+    normalized disagree and raw/raw-component evidence is cleaner, raw evidence
+    becomes the selected-opening frame authority.  Normalized candidates remain
+    diagnostics only for that run.
     """
 
-    collapsed_or_disagrees = bool(
+    collapse_disagreement = bool(
         audit.get("normalized_rim_collapse_suspected", False)
         and not bool(audit.get("raw_vs_normalized_measurement_agree", False))
     )
+    raw_opening_override, raw_opening_override_diag = _audit_raw_opening_authority_override(audit)
+    normalized_forbidden = bool(collapse_disagreement or raw_opening_override)
 
     rows: list[dict[str, object]] = []
-    source_order = ("raw_component_candidates", "raw_candidates") if collapsed_or_disagrees else ("raw_component_candidates", "raw_candidates", "normalized_candidates")
+    source_order = ("raw_component_candidates", "raw_candidates") if normalized_forbidden else ("raw_component_candidates", "raw_candidates", "normalized_candidates")
     for source_key in source_order:
         source_rows = audit.get(source_key, ())
         try:
@@ -559,7 +715,9 @@ def _selected_opening_frame_resolver(
             "resolved": False,
             "resolver_status": "no_measured_opening_candidates",
             "semantic_stage": "selected_edge_evidence_to_measured_bore_frame",
-            "normalized_candidates_forbidden_by_collapse_audit": bool(collapsed_or_disagrees),
+            "normalized_candidates_forbidden_by_collapse_audit": bool(collapse_disagreement),
+            "normalized_candidates_forbidden_by_raw_authority_override": bool(raw_opening_override),
+            "raw_opening_authority_override": dict(raw_opening_override_diag),
         }
 
     region_axis = canonical_axis(region_axis)
@@ -584,7 +742,7 @@ def _selected_opening_frame_resolver(
         largest_fraction = _finite_float_value(row.get("largest_component_fraction", 1.0), 1.0)
         strategy = str(row.get("component_strategy", "") or "")
 
-        if collapsed_or_disagrees:
+        if normalized_forbidden:
             # RegionData/normalized rim may already be wrong.  Score the raw
             # component measurement as selected-opening evidence in its own
             # right.  Keep region metrics as diagnostics only.
@@ -624,9 +782,10 @@ def _selected_opening_frame_resolver(
             "resolver_axis_abs_dot_to_region": float(axis_dot),
             "resolver_radius_delta_rel_to_region": float(radius_delta_rel),
             "resolver_centerline_distance_to_region": float(centerline_distance),
-            "resolver_component_mode": "raw_component_required" if collapsed_or_disagrees else "normal_region_agreement_mode",
-            "resolver_normalized_candidates_forbidden": bool(collapsed_or_disagrees),
-            "resolver_source_bonus_or_penalty_applied": float(-999.0 if source == "normalized_candidates" and collapsed_or_disagrees else (1.35 if source == "raw_component_candidates" and collapsed_or_disagrees else 0.0)),
+            "resolver_component_mode": "raw_component_required" if normalized_forbidden else "normal_region_agreement_mode",
+            "resolver_normalized_candidates_forbidden": bool(normalized_forbidden),
+            "resolver_normalized_forbidden_reason": ("raw_opening_authority_override" if raw_opening_override else ("collapse_disagreement" if collapse_disagreement else "")),
+            "resolver_source_bonus_or_penalty_applied": float(-999.0 if source == "normalized_candidates" and normalized_forbidden else (1.35 if source == "raw_component_candidates" and normalized_forbidden else 0.0)),
         }
         scored.append((float(score), scored_row))
 
@@ -638,7 +797,9 @@ def _selected_opening_frame_resolver(
             "resolved": False,
             "resolver_status": "all_measured_candidates_invalid",
             "semantic_stage": "selected_edge_evidence_to_measured_bore_frame",
-            "normalized_candidates_forbidden_by_collapse_audit": bool(collapsed_or_disagrees),
+            "normalized_candidates_forbidden_by_collapse_audit": bool(collapse_disagreement),
+            "normalized_candidates_forbidden_by_raw_authority_override": bool(raw_opening_override),
+            "raw_opening_authority_override": dict(raw_opening_override_diag),
         }
 
     radius_delta = _finite_float_value(best.get("resolver_radius_delta_rel_to_region", 999.0), 999.0)
@@ -650,9 +811,9 @@ def _selected_opening_frame_resolver(
     edge_count = int(best.get("edge_count", 0) or 0)
     radius_rel_rms = _finite_float_value(best.get("radius_rel_rms", 1.0), 1.0)
 
-    if collapsed_or_disagrees:
+    if normalized_forbidden:
         stable = bool(
-            source == "raw_component_candidates"
+            source in {"raw_component_candidates", "raw_candidates"}
             and score >= 1.55
             and edge_count >= 6
             and confidence >= 0.18
@@ -680,20 +841,33 @@ def _selected_opening_frame_resolver(
             "axis": tuple(float(v) for v in tuple(best.get("axis", (0.0, 0.0, 1.0)))[:3]),
             "radius": float(best.get("radius", region_radius) or region_radius),
             "diameter": float(2.0 * float(best.get("radius", region_radius) or region_radius)),
+            "radius_min": float(best.get("radius_min", best.get("radius", region_radius)) or best.get("radius", region_radius) or region_radius),
+            "radius_nominal": float(best.get("radius", region_radius) or region_radius),
+            "radius_max": float(best.get("radius_max", best.get("radius", region_radius)) or best.get("radius", region_radius) or region_radius),
+            "diameter_min": float(best.get("diameter_min", 2.0 * float(best.get("radius_min", best.get("radius", region_radius)) or best.get("radius", region_radius) or region_radius)) or 0.0),
+            "diameter_nominal": float(2.0 * float(best.get("radius", region_radius) or region_radius)),
+            "diameter_max": float(best.get("diameter_max", 2.0 * float(best.get("radius_max", best.get("radius", region_radius)) or best.get("radius", region_radius) or region_radius)) or 0.0),
+            "radial_spread": float(best.get("radial_spread", 0.0) or 0.0),
+            "radial_spread_ratio": float(best.get("radial_spread_ratio", 0.0) or 0.0),
+            "coarse_polygonal": bool(best.get("coarse_polygonal", False)),
+            "radial_envelope": dict(best.get("radial_envelope", {}) or {}) if isinstance(best.get("radial_envelope", {}), Mapping) else {},
             "edge_ids": edge_ids,
             "edge_count": int(len(edge_ids) or edge_count),
             "primary_edge_ids": primary_edge_ids,
             "primary_edge_count": int(len(primary_edge_ids)),
             "expanded_edge_ids": expanded_edge_ids,
             "expanded_edge_count": int(len(expanded_edge_ids)),
-            "seed_island_authority": "primary_raw_component_edges",
+            "seed_island_authority": ("raw_opening_authority_override_v149" if raw_opening_override else "primary_raw_component_edges"),
             "confidence": float(confidence),
             "score": float(score),
             "axis_abs_dot_to_region": float(axis_dot),
             "radius_delta_rel_to_region": float(radius_delta),
             "centerline_distance_to_region": float(center_dist),
             "raw_component_resolver_used": bool(source == "raw_component_candidates"),
-            "normalized_candidates_forbidden_by_collapse_audit": bool(collapsed_or_disagrees),
+            "normalized_candidates_forbidden_by_collapse_audit": bool(collapse_disagreement),
+            "normalized_candidates_forbidden_by_raw_authority_override": bool(raw_opening_override),
+            "raw_opening_authority_override": dict(raw_opening_override_diag),
+            "selected_opening_authority_policy": ("raw_measurement_override_v149" if raw_opening_override else ("collapse_disagreement_raw_only" if collapse_disagreement else "normal_region_agreement_mode")),
             "candidate": best,
             "candidate_rankings": tuple(dict(row) for _score, row in scored[:12]),
             "forbidden_transfer": "MeasuredBoreFrame is evidence for Recognition; it is not CandidateData or rebuild authority.",
@@ -710,7 +884,10 @@ def _selected_opening_frame_resolver(
         "best_radius_delta_rel_to_region": float(radius_delta),
         "best_centerline_distance_to_region": float(center_dist),
         "raw_component_resolver_used": bool(source == "raw_component_candidates"),
-        "normalized_candidates_forbidden_by_collapse_audit": bool(collapsed_or_disagrees),
+        "normalized_candidates_forbidden_by_collapse_audit": bool(collapse_disagreement),
+        "normalized_candidates_forbidden_by_raw_authority_override": bool(raw_opening_override),
+        "raw_opening_authority_override": dict(raw_opening_override_diag),
+        "selected_opening_authority_policy": ("raw_measurement_override_v149" if raw_opening_override else ("collapse_disagreement_raw_only" if collapse_disagreement else "normal_region_agreement_mode")),
         "candidate_rankings": tuple(dict(row) for _score, row in scored[:12]),
         "region_fallback_edge_ids": tuple_ints(region_edge_ids),
         "region_fallback_seed_face_ids": tuple_ints(region_seed_face_ids),

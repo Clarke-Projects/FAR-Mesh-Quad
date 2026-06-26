@@ -1,22 +1,42 @@
-"""Prepare delete-patch proposals from CandidateData.
+"""Prepare bounded delete-patch proposals from CandidateData.
 
 The target contract is separate from Recognition and from mesh mutation:
 
     CandidateData in -> DeletePatchProposal out
 
-Later phases will move the existing topology-seal/protected-fragment logic out
-of rebuild.py into this module.  Phase 83 provides the typed adapter and
-diagnostic shape without changing rebuild behavior yet.
+This module decides whether an accepted candidate may request a delete/rebuild
+operation and which explicit face set is allowed to become the bounded target.
+It does not classify features, fit primitives, generate replacement topology,
+mutate mesh data, or decide final rebuild acceptance.
+
+Some legacy/local target-construction helpers still live in ``rebuild.py`` for
+behavior compatibility.  Future cleanup should migrate target-policy logic here
+without moving semantic remesh planning or trial validation out of rebuild.py.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from .types import CandidateData, DeletePatchProposal, EdgeKey, FeatureFamily, RecognitionStage, tuple_edges, tuple_ints
+from ..types import CandidateData, DeletePatchProposal, EdgeKey, FeatureFamily, RecognitionStage, tuple_edges, tuple_ints
 
 
 _REBUILD_ALLOWED_FAMILIES = {FeatureFamily.BORE.value, FeatureFamily.CHAMFER_FORM.value, FeatureFamily.POCKET.value, FeatureFamily.CIRCULAR_POCKET.value}
+
+
+@dataclass(frozen=True, slots=True)
+class RebuildTargetPatch:
+    """One bounded delete-patch face set proposed by target policy.
+
+    This object belongs to the rebuild-target stage.  It carries only source
+    diagnostics and explicit face IDs.  It is not a geometry plan, not a
+    boundary-loop pair, and not a validated rebuild result.  ``rebuild.py``
+    consumes these target patches to derive loop attempts and trial meshes.
+    """
+
+    source: str
+    face_ids: tuple[int, ...]
 
 
 def _candidate_stage_and_family(candidate: CandidateData | Mapping[str, object]) -> tuple[str, str]:
@@ -99,6 +119,11 @@ def prepare_rebuild_target(
         allow_unequal_loop_transition=True,
         diagnostics={
             "source": "candidate_to_delete_patch_proposal_adapter_phase83",
+            "target_policy_contract": "candidate_data_to_delete_patch_proposal_only",
+            "candidate_data_to_delete_patch_contract": True,
+            "not_feature_recognition": True,
+            "not_mesh_mutation": True,
+            "not_rebuild_validation": True,
             "candidate_data": base_diag,
             "recognition_stage_target_gate": _candidate_stage_and_family(candidate)[0],
             "feature_family_target_gate": _candidate_stage_and_family(candidate)[1],
@@ -120,7 +145,7 @@ def target_from_candidate_dict(candidate: Mapping[str, object]) -> DeletePatchPr
 
 import numpy as np
 
-from .topology import connected_face_components, face_edges
+from ..topology import connected_face_components, face_edges
 
 
 def loop_vertices_to_edge_keys(loop_vertices: Iterable[object]) -> tuple[EdgeKey, ...]:
@@ -136,6 +161,24 @@ def loop_vertices_to_edge_keys(loop_vertices: Iterable[object]) -> tuple[EdgeKey
             continue
         edges.add((int(a), int(b)) if int(a) < int(b) else (int(b), int(a)))
     return tuple(sorted(edges))
+
+
+def target_patches_from_result(target_result: Mapping[str, object]) -> tuple[RebuildTargetPatch, ...]:
+    """Convert a target-policy dictionary into typed RebuildTargetPatch rows.
+
+    ``build_bounded_rebuild_target_face_sets`` still returns a serializable
+    dictionary for compatibility with existing diagnostics.  This adapter is the
+    semantic boundary where those explicit face sets become typed delete-patch
+    proposals for rebuild planning.  It does not add, remove, or reorder face
+    IDs.
+    """
+
+    patches: list[RebuildTargetPatch] = []
+    for raw_source, raw_ids in tuple(target_result.get("face_sets", ()) or ()):  # serializable policy rows
+        ids = tuple(sorted({int(fid) for fid in tuple(raw_ids or ())}))
+        if ids:
+            patches.append(RebuildTargetPatch(str(raw_source), ids))
+    return tuple(patches)
 
 
 def build_bounded_rebuild_target_face_sets(
@@ -156,12 +199,11 @@ def build_bounded_rebuild_target_face_sets(
     final rebuild.  ``rebuild.py`` still performs loop-plan construction and
     watertight trial validation.
 
-    The returned ``face_sets`` are ordered by semantic rebuild-target quality:
-
-    1. topology-sealed two-rim targets of the owned candidate;
-    2. explicit protected-fragment bridge targets;
-    3. exact candidate patch;
-    4. compatible component/fallback targets.
+    For accepted CandidateData rows, the returned delete-patch face set is the
+    exact CandidateData-owned rebuild face set.  Topology sealing, connected
+    component variants, and damaged-bore expansion are not alternative meanings
+    of the same CandidateData object; they require a future explicit
+    RebuildTarget semantic object.
 
     Broad feature absorption is rejected here, before rebuild attempts are made.
     """
@@ -185,6 +227,50 @@ def build_bounded_rebuild_target_face_sets(
             protected_loop_edges.update(loop_vertices_to_edge_keys(tuple(int(v) for v in tuple(protected_loop or ()))))
 
     initial_set = set(initial)
+
+    # v172g semantic meaning invariant:
+    # When the caller provides accepted CandidateData rebuild_face_ids, those
+    # faces already mean the owned delete-patch proposal.  rebuild_target.py may
+    # describe this mapping and reject/record alternatives, but it must not
+    # synthesize a larger/smaller face set from topology closure, RegionData,
+    # measured frames, or connected components.  Any future expanded repair
+    # target must arrive as its own explicit RebuildTarget semantic object, not
+    # as an implicit compatibility variant.
+    if bool(preview_candidate_patch_owns_delete):
+        rejected_face_sets = []
+        for extra_source, extra_ids_raw in tuple(extra_candidate_face_sets or ()):  # diagnostics only
+            extra_ids = tuple(sorted({int(fid) for fid in tuple(extra_ids_raw or ()) if 0 <= int(fid) < len(faces)}))
+            if extra_ids and set(extra_ids) != initial_set:
+                rejected_face_sets.append({
+                    "source": str(extra_source),
+                    "face_count": int(len(extra_ids)),
+                    "reason": "v172g_candidate_data_delete_patch_faces_are_exact_no_implicit_target_variant",
+                })
+        return {
+            "valid": True,
+            "face_sets": (("initial_final_delete_faces", initial),),
+            "rejected_candidate_owned_face_sets": tuple(rejected_face_sets),
+            "diagnostics": {
+                "v33_semantic_boundary_hardening_used": True,
+                "v172g_candidate_data_delete_patch_meaning_invariant_used": True,
+                "candidate_data_to_delete_patch_contract": True,
+                "target_policy_contract": "candidate_data_rebuild_faces_equal_delete_patch_faces",
+                "region_data_union_enabled": False,
+                "region_data_as_delete_patch_authority": False,
+                "topology_variant_face_sets_enabled": False,
+                "connected_component_face_set_variants_enabled": False,
+                "source": "rebuild_target.build_bounded_rebuild_target_face_sets",
+                "initial_face_count": int(len(initial)),
+                "candidate_owned": True,
+                "protected_rim_edge_count": int(len(protected_loop_edges)),
+                "component_count": int(len(connected_face_components(faces, initial))),
+                "face_set_count": 1,
+                "face_set_sources": ("initial_final_delete_faces",),
+                "parameter_fit_used_for_target": False,
+                "radius_used_for_delete_expansion": False,
+                "axis_used_for_delete_expansion": False,
+            },
+        }
 
     def _face_ids_touch_protected_rim(face_ids_to_check: set[int]) -> bool:
         if not protected_loop_edges or not face_ids_to_check:
@@ -361,7 +447,10 @@ def build_bounded_rebuild_target_face_sets(
         "rejected_candidate_owned_face_sets": tuple(rejected_face_sets),
         "diagnostics": {
             "v33_semantic_boundary_hardening_used": True,
+            "candidate_data_to_delete_patch_contract": True,
+            "target_policy_contract": "bounded_candidate_owned_face_sets_only",
             "region_data_union_enabled": False,
+            "region_data_as_delete_patch_authority": False,
             "source": "rebuild_target.build_bounded_rebuild_target_face_sets",
             "initial_face_count": int(len(initial)),
             "candidate_owned": bool(preview_candidate_patch_owns_delete),

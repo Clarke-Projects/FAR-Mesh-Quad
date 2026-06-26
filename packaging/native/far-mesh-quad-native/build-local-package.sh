@@ -3,7 +3,7 @@ set -euo pipefail
 
 PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${PKG_ROOT}/../../.." && pwd)"
-VERSION="0.1.2"
+VERSION="0.1.3"
 STAGING_ROOT="${PKG_ROOT}/_staging"
 STAGING="${STAGING_ROOT}/far-mesh-quad-native-${VERSION}"
 MODE="makepkg"
@@ -109,6 +109,41 @@ find "${STAGING}" -type d \( -name ".git" -o -name ".hg" -o -name ".svn" \) -pru
 # exist in a clean public clone, but removing them here keeps dev packaging safe.
 rm -rf "${STAGING}/scripts/test_cleanup_archive" 2>/dev/null || true
 find "${STAGING}/far_mesh" -maxdepth 1 -type f \( -name "*.before_*" -o -name "*.bak" -o -name "*.orig" \) -delete 2>/dev/null || true
+
+
+validate_folderized_bore_payload() {
+  echo
+  echo "== Validating folderized BoreTool package imports =="
+  (cd "${STAGING}" && /usr/bin/python - <<'PY'
+import far_mesh
+print("OK far_mesh staged import", getattr(far_mesh, "__file__", ""))
+
+from far_mesh.core.bore import (
+    RebuildResult,
+    RebuildTargetPatch,
+    delete_and_rebuild_candidate_region,
+    recognize_bore_region_selection,
+    select_region_data,
+    target_patches_from_result,
+)
+from far_mesh.core.bore.selection.region_select import select_region_data as select_region_data_direct
+from far_mesh.core.bore.selection.mesh_realization import build_opening_evidence_ledger_from_arrays
+from far_mesh.core.bore.recognition.recognition import recognize_bore_region_selection as recognize_direct
+from far_mesh.core.bore.recognition.recognition_component_engine import component_engine_feature_candidates
+from far_mesh.core.bore.rebuild.rebuild import delete_and_rebuild_candidate_region as rebuild_direct
+from far_mesh.core.bore.rebuild.rebuild_inventory import rebuild_refactor_inventory_v177k
+
+print("OK folderized Bore public API", RebuildResult.__name__, RebuildTargetPatch.__name__)
+print("OK folderized Bore selection", select_region_data_direct.__name__)
+print("OK folderized Bore mesh realization", build_opening_evidence_ledger_from_arrays.__name__)
+print("OK folderized Bore recognition", recognize_direct.__name__, component_engine_feature_candidates.__name__)
+print("OK folderized Bore rebuild", rebuild_direct.__name__)
+print("OK folderized Bore inventory", rebuild_refactor_inventory_v177k().get("checkpoint", "unknown"))
+PY
+  )
+}
+
+validate_folderized_bore_payload
 
 echo
 echo "== Native staging size =="

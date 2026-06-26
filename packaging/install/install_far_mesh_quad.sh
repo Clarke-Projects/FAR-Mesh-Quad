@@ -128,7 +128,7 @@ PKG_ROOT="${PROJECT_ROOT}/packaging/native/far-mesh-quad-native"
 WGPU_ROOT="${PROJECT_ROOT}/packaging/native/wgpu-stack"
 WGPU_PACKAGES_DIR="${WGPU_ROOT}/packages"
 OPEN3D_PKG="${PROJECT_ROOT}/packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst"
-STAGING="${PKG_ROOT}/_staging/far-mesh-quad-native-0.1.2"
+STAGING="${PKG_ROOT}/_staging/far-mesh-quad-native-0.1.3"
 DESKTOP_SRC="${PKG_ROOT}/far-mesh-quad-native.desktop"
 WRAPPER_SRC="${PKG_ROOT}/far-mesh-quad-native-wrapper.c"
 WRAPPER_BUILD="${PKG_ROOT}/far-mesh-quad-native-wrapper"
@@ -459,6 +459,31 @@ PY
   (cd "$APP_ROOT" && run_cmd /usr/bin/python - <<'PY'
 import far_mesh
 print("OK far_mesh import from installed app root", getattr(far_mesh, "__file__", ""))
+
+# v0.1.3 folderized BoreTool package validation.
+# This catches stale top-level imports after the Bore package split into
+# selection/, recognition/, and rebuild/.
+from far_mesh.core.bore import (
+    RebuildResult,
+    RebuildTargetPatch,
+    delete_and_rebuild_candidate_region,
+    recognize_bore_region_selection,
+    select_region_data,
+    target_patches_from_result,
+)
+from far_mesh.core.bore.selection.region_select import select_region_data as select_region_data_direct
+from far_mesh.core.bore.selection.mesh_realization import build_opening_evidence_ledger_from_arrays
+from far_mesh.core.bore.recognition.recognition import recognize_bore_region_selection as recognize_direct
+from far_mesh.core.bore.recognition.recognition_component_engine import component_engine_feature_candidates
+from far_mesh.core.bore.rebuild.rebuild import delete_and_rebuild_candidate_region as rebuild_direct
+from far_mesh.core.bore.rebuild.rebuild_inventory import rebuild_refactor_inventory_v177k
+
+print("OK folderized Bore public API", RebuildResult.__name__, RebuildTargetPatch.__name__)
+print("OK folderized Bore selection", select_region_data_direct.__name__)
+print("OK folderized Bore mesh realization", build_opening_evidence_ledger_from_arrays.__name__)
+print("OK folderized Bore recognition", recognize_direct.__name__, component_engine_feature_candidates.__name__)
+print("OK folderized Bore rebuild", rebuild_direct.__name__)
+print("OK folderized Bore inventory", rebuild_refactor_inventory_v177k().get("checkpoint", "unknown"))
 PY
   )
 

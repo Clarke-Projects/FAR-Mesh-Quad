@@ -1,5 +1,5 @@
 pkgname=far-mesh-quad-native
-pkgver=0.1.2
+pkgver=0.1.3
 pkgrel=1
 pkgdesc="FAR MESH Quad native no-venv package"
 arch=("x86_64")

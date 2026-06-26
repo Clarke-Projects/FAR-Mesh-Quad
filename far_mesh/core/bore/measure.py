@@ -48,6 +48,60 @@ EdgeKey = tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
+class BoreOpeningRadialEnvelope:
+    """Unified radial-envelope measurement for every bore opening.
+
+    This is not a coarse-mesh special case.  Every measured opening has a
+    radial envelope.  Dense circular rims naturally produce a narrow envelope
+    where min/nominal/max are almost identical.  Coarse polygonal rims produce a
+    wider envelope where the inward flats/segments and outward corner vertices
+    are both preserved as measurement evidence.
+
+    ``radius`` on older contracts remains the nominal fitted radius.  The
+    envelope makes the lower and upper support explicit without changing the
+    semantic stage: selected rim evidence -> opening measurement evidence.
+    """
+
+    center: Vector3
+    axis: Vector3
+    radius_min: float
+    radius_nominal: float
+    radius_max: float
+    diameter_min: float
+    diameter_nominal: float
+    diameter_max: float
+    radial_spread: float
+    radial_spread_ratio: float
+    vertex_sample_count: int
+    edge_midpoint_sample_count: int
+    segment_distance_sample_count: int
+    coarse_polygonal: bool
+    diagnostics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contract_type": "bore_opening_radial_envelope",
+            "semantic_stage": "rim_evidence_to_unified_opening_radial_envelope",
+            "not_coarse_mesh_special_case": True,
+            "center": self.center,
+            "axis": self.axis,
+            "radius_min": float(self.radius_min),
+            "radius_nominal": float(self.radius_nominal),
+            "radius_max": float(self.radius_max),
+            "diameter_min": float(self.diameter_min),
+            "diameter_nominal": float(self.diameter_nominal),
+            "diameter_max": float(self.diameter_max),
+            "radial_spread": float(self.radial_spread),
+            "radial_spread_ratio": float(self.radial_spread_ratio),
+            "vertex_sample_count": int(self.vertex_sample_count),
+            "edge_midpoint_sample_count": int(self.edge_midpoint_sample_count),
+            "segment_distance_sample_count": int(self.segment_distance_sample_count),
+            "coarse_polygonal": bool(self.coarse_polygonal),
+            "diagnostics": dict(self.diagnostics or {}),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BoreOpeningMeasurement:
     """Measurement of one selected/near-selected bore opening."""
 
@@ -73,6 +127,14 @@ class BoreOpeningMeasurement:
     radius_mad: float
     circularity: float
     confidence: float
+    radius_min: float | None = None
+    radius_max: float | None = None
+    diameter_min: float | None = None
+    diameter_max: float | None = None
+    radial_spread: float | None = None
+    radial_spread_ratio: float | None = None
+    coarse_polygonal: bool = False
+    radial_envelope: Mapping[str, object] = field(default_factory=dict)
     diagnostics: dict[str, object] = field(default_factory=dict)
 
 
@@ -151,6 +213,260 @@ class BoreTwoOpeningMeasurement:
 # -----------------------------------------------------------------------------
 # Public measurement API
 # -----------------------------------------------------------------------------
+
+
+def _projected_segment_distance_to_center(
+    *,
+    vertices: np.ndarray,
+    edge: EdgeKey,
+    center: np.ndarray,
+    axis: np.ndarray,
+) -> float | None:
+    """Return center-to-edge distance in the opening plane.
+
+    For a coarse polygonal opening this distance is the important lower radius:
+    the segment/flat protruding into the opening can be closer to the center
+    than the corner vertices.  This is the geometric source of the min diameter.
+    """
+
+    try:
+        a, b = normalize_edge(edge)
+    except Exception:
+        return None
+    if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+        return None
+    p0 = np.asarray(vertices[int(a), :3], dtype=float).reshape(3) - center
+    p1 = np.asarray(vertices[int(b), :3], dtype=float).reshape(3) - center
+    p0 = p0 - axis * float(np.dot(p0, axis))
+    p1 = p1 - axis * float(np.dot(p1, axis))
+    seg = p1 - p0
+    seg_len_sq = float(np.dot(seg, seg))
+    if not np.isfinite(seg_len_sq) or seg_len_sq <= 1.0e-18:
+        return None
+    t = float(-np.dot(p0, seg) / seg_len_sq)
+    t = max(0.0, min(1.0, t))
+    closest = p0 + t * seg
+    dist = float(np.linalg.norm(closest))
+    return dist if np.isfinite(dist) and dist > 1.0e-12 else None
+
+
+def _finite_positive_values(values: Iterable[object]) -> np.ndarray:
+    arr = np.asarray(tuple(float(v) for v in tuple(values or ())), dtype=float)
+    if arr.size == 0:
+        return np.empty((0,), dtype=float)
+    return arr[np.isfinite(arr) & (arr > 1.0e-12)]
+
+
+def _robust_percentile(values: Iterable[object], percentile: float, fallback: float) -> float:
+    arr = _finite_positive_values(values)
+    if arr.size == 0:
+        return float(fallback)
+    try:
+        return float(np.percentile(arr, float(percentile)))
+    except Exception:
+        return float(fallback)
+
+
+def _measure_opening_radial_envelope(
+    *,
+    vertices: np.ndarray,
+    measurement_edges: Iterable[EdgeKey],
+    selected_vertices: Iterable[int],
+    ring: RingFit,
+) -> BoreOpeningRadialEnvelope:
+    """Measure the min/nominal/max opening envelope for any rim.
+
+    This is the default measurement model, not a parallel coarse-mesh route.
+    The nominal ring fit is established first, then the lower/upper envelope is
+    measured only from samples that still behave like rim-band evidence in that
+    same frame.  This prevents coarse or triangulated meshes from reporting a
+    tiny ``radius_min`` merely because a spoke, floor chord, or transition edge
+    crosses the opening interior.
+
+    A dense circular opening is the low-spread case.  A coarse polygonal opening
+    is the high-spread case.  Interior/chord contamination is rejected before the
+    envelope becomes measurement truth.
+    """
+
+    center = np.asarray(ring.center, dtype=float).reshape(3)
+    axis = unit_vector(ring.axis)
+    radius_nominal = float(ring.radius)
+    edge_set = {normalize_edge(edge) for edge in tuple(measurement_edges or ())}
+    vertex_ids = tuple(sorted({int(v) for v in tuple(selected_vertices or ()) if 0 <= int(v) < len(vertices)}))
+
+    # The band is deliberately expressed relative to the nominal radius rather
+    # than edge count.  It is therefore the normal route for all meshes.  Hex / square
+    # approximations keep their inradius evidence; interior fan spokes do not.
+    if radius_nominal > 1.0e-12:
+        lower_band = max(1.0e-12, float(radius_nominal) * 0.62)
+        upper_band = max(float(radius_nominal) * 1.42, float(radius_nominal) + 1.0e-12)
+        fallback_radius_min = float(radius_nominal) * 0.92
+        fallback_radius_max = float(radius_nominal) * 1.08
+    else:
+        lower_band = 1.0e-12
+        upper_band = float("inf")
+        fallback_radius_min = float(radius_nominal)
+        fallback_radius_max = float(radius_nominal)
+
+    vertex_radii_all: list[float] = []
+    vertex_radii_band: list[float] = []
+    for vid in vertex_ids:
+        rel = np.asarray(vertices[int(vid), :3], dtype=float).reshape(3) - center
+        radial = rel - axis * float(np.dot(rel, axis))
+        dist = float(np.linalg.norm(radial))
+        if np.isfinite(dist) and dist > 1.0e-12:
+            vertex_radii_all.append(dist)
+            if lower_band <= dist <= upper_band:
+                vertex_radii_band.append(dist)
+
+    midpoint_radii_all: list[float] = []
+    midpoint_radii_band: list[float] = []
+    segment_distances_all: list[float] = []
+    segment_distances_band: list[float] = []
+    rejected_spoke_edge_count = 0
+    rejected_interior_segment_count = 0
+    rejected_out_of_band_sample_count = 0
+
+    for edge in edge_set:
+        try:
+            a, b = normalize_edge(edge)
+        except Exception:
+            continue
+        if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices):
+            continue
+        pa3 = np.asarray(vertices[int(a), :3], dtype=float).reshape(3)
+        pb3 = np.asarray(vertices[int(b), :3], dtype=float).reshape(3)
+        mid3 = 0.5 * (pa3 + pb3)
+        rel_mid = mid3 - center
+        axial_mid = float(np.dot(rel_mid, axis))
+        radial_vec_mid = rel_mid - axis * axial_mid
+        midpoint_radius = float(np.linalg.norm(radial_vec_mid))
+        if np.isfinite(midpoint_radius) and midpoint_radius > 1.0e-12:
+            midpoint_radii_all.append(midpoint_radius)
+
+        edge_vec = pb3 - pa3
+        edge_len = float(np.linalg.norm(edge_vec))
+        radial_alignment = 0.0
+        axial_alignment = 0.0
+        obvious_spoke = False
+        if edge_len > 1.0e-12 and midpoint_radius > 1.0e-12:
+            tangent = edge_vec / edge_len
+            radial_unit = radial_vec_mid / midpoint_radius
+            radial_alignment = abs(float(np.dot(tangent, radial_unit)))
+            axial_alignment = abs(float(np.dot(tangent, axis)))
+            # A rim side is tangential to the opening.  A radial spoke points
+            # across the opening interior.  Do not let spokes define r_min.
+            obvious_spoke = bool(radial_alignment > 0.88 and axial_alignment < 0.45)
+
+        midpoint_in_band = bool(lower_band <= midpoint_radius <= upper_band)
+        if midpoint_in_band and not obvious_spoke:
+            midpoint_radii_band.append(midpoint_radius)
+        elif np.isfinite(midpoint_radius) and midpoint_radius > 1.0e-12:
+            rejected_out_of_band_sample_count += 0 if midpoint_in_band else 1
+
+        seg_dist = _projected_segment_distance_to_center(vertices=vertices, edge=edge, center=center, axis=axis)
+        if seg_dist is not None:
+            segment_distances_all.append(float(seg_dist))
+            if obvious_spoke:
+                rejected_spoke_edge_count += 1
+            elif float(seg_dist) < lower_band:
+                rejected_interior_segment_count += 1
+            elif float(seg_dist) <= upper_band:
+                segment_distances_band.append(float(seg_dist))
+            else:
+                rejected_out_of_band_sample_count += 1
+
+    lower_samples = segment_distances_band or midpoint_radii_band or vertex_radii_band or [fallback_radius_min]
+    upper_samples = vertex_radii_band or midpoint_radii_band or segment_distances_band or [fallback_radius_max]
+
+    # If the rim-band filter removes almost all support, do not publish a wildly
+    # wide envelope.  Fall back to a conservative nominal band and record why.
+    filtered_support = int(len(vertex_radii_band) + len(midpoint_radii_band) + len(segment_distances_band))
+    all_support = int(len(vertex_radii_all) + len(midpoint_radii_all) + len(segment_distances_all))
+    low_support_fallback = bool(filtered_support < max(6, min(12, len(edge_set))))
+    if low_support_fallback:
+        lower_samples = [fallback_radius_min, radius_nominal]
+        upper_samples = [radius_nominal, fallback_radius_max]
+
+    lower_percentile = 10.0 if len(lower_samples) >= 8 else 0.0
+    upper_percentile = 90.0 if len(upper_samples) >= 8 else 100.0
+    radius_min = _robust_percentile(lower_samples, lower_percentile, radius_nominal)
+    radius_max = _robust_percentile(upper_samples, upper_percentile, radius_nominal)
+
+    if radius_min > radius_max:
+        radius_min, radius_max = radius_max, radius_min
+    if radius_nominal > 1.0e-12:
+        radius_min = max(lower_band, min(float(radius_min), float(radius_nominal) * 1.12))
+        radius_max = min(upper_band, max(float(radius_max), float(radius_nominal) * 0.88))
+    radius_max = max(float(radius_max), float(radius_min), 1.0e-12)
+    radial_spread = float(max(0.0, radius_max - radius_min))
+    radial_spread_ratio = float(radial_spread / max(float(radius_nominal), 1.0e-12))
+
+    coarse_polygonal = bool(
+        radial_spread_ratio >= 0.045
+        or float(ring.radius_rel_rms) >= 0.045
+        or (len(edge_set) <= 16 and radial_spread_ratio >= 0.025)
+    )
+
+    def _stats(vals: Iterable[float]) -> dict[str, object]:
+        arr = _finite_positive_values(vals)
+        if arr.size == 0:
+            return {"count": 0}
+        return {
+            "count": int(arr.size),
+            "min": float(arr.min()),
+            "p10": float(np.percentile(arr, 10.0)),
+            "median": float(np.median(arr)),
+            "p90": float(np.percentile(arr, 90.0)),
+            "max": float(arr.max()),
+        }
+
+    envelope = BoreOpeningRadialEnvelope(
+        center=to_vector3(center),
+        axis=to_vector3(canonical_axis(axis)),
+        radius_min=float(radius_min),
+        radius_nominal=float(radius_nominal),
+        radius_max=float(radius_max),
+        diameter_min=float(2.0 * radius_min),
+        diameter_nominal=float(2.0 * radius_nominal),
+        diameter_max=float(2.0 * radius_max),
+        radial_spread=float(radial_spread),
+        radial_spread_ratio=float(radial_spread_ratio),
+        vertex_sample_count=int(len(vertex_radii_band)),
+        edge_midpoint_sample_count=int(len(midpoint_radii_band)),
+        segment_distance_sample_count=int(len(segment_distances_band)),
+        coarse_polygonal=bool(coarse_polygonal),
+        diagnostics={
+            "normal_measurement_route": "all_openings_are_radial_envelopes",
+            "dense_circle_is_low_spread_case": True,
+            "coarse_polygon_is_high_spread_case": True,
+            "v118_ring_band_filtered_envelope": True,
+            "lower_radius_source": "ring_band_filtered_projected_edge_segment_distance_percentile",
+            "upper_radius_source": "ring_band_filtered_rim_vertex_radius_percentile",
+            "lower_band_radius": float(lower_band),
+            "upper_band_radius": float(upper_band),
+            "fallback_radius_min": float(fallback_radius_min),
+            "fallback_radius_max": float(fallback_radius_max),
+            "low_support_fallback_used": bool(low_support_fallback),
+            "filtered_support_count": int(filtered_support),
+            "all_support_count": int(all_support),
+            "rejected_spoke_edge_count": int(rejected_spoke_edge_count),
+            "rejected_interior_segment_count": int(rejected_interior_segment_count),
+            "rejected_out_of_band_sample_count": int(rejected_out_of_band_sample_count),
+            "lower_percentile": float(lower_percentile),
+            "upper_percentile": float(upper_percentile),
+            "vertex_radii_all": _stats(vertex_radii_all),
+            "edge_midpoint_radii_all": _stats(midpoint_radii_all),
+            "segment_distances_all": _stats(segment_distances_all),
+            "vertex_radii_band": _stats(vertex_radii_band),
+            "edge_midpoint_radii_band": _stats(midpoint_radii_band),
+            "segment_distances_band": _stats(segment_distances_band),
+            "ring_radius_rel_rms": float(ring.radius_rel_rms),
+            "ring_radius_mad": float(ring.radius_mad),
+            "ring_circularity": float(ring.circularity),
+        },
+    )
+    return envelope
 
 
 def measure_bore_opening(
@@ -286,6 +602,13 @@ def measure_bore_opening(
         1.0,
     )
 
+    radial_envelope = _measure_opening_radial_envelope(
+        vertices=vertices,
+        measurement_edges=measurement_edges,
+        selected_vertices=selected_vertices,
+        ring=ring,
+    )
+
     diagnostics: dict[str, object] = {
         "mode": "bore_opening_measurement",
         "input_edge_count": len(selected_edge_ids),
@@ -301,6 +624,16 @@ def measure_bore_opening(
         "median_edge_length": median_edge_length,
         "axis_hint": axis_hint(ring.axis),
         "ring_fit": dict(ring.diagnostics),
+        "radial_envelope": radial_envelope.to_dict(),
+        "radius_min": float(radial_envelope.radius_min),
+        "radius_nominal": float(radial_envelope.radius_nominal),
+        "radius_max": float(radial_envelope.radius_max),
+        "diameter_min": float(radial_envelope.diameter_min),
+        "diameter_nominal": float(radial_envelope.diameter_nominal),
+        "diameter_max": float(radial_envelope.diameter_max),
+        "radial_spread": float(radial_envelope.radial_spread),
+        "radial_spread_ratio": float(radial_envelope.radial_spread_ratio),
+        "coarse_polygonal": bool(radial_envelope.coarse_polygonal),
         "graph": {k: v for k, v in graph.items() if k != "endpoint_vertices"},
     }
 
@@ -327,6 +660,14 @@ def measure_bore_opening(
         radius_mad=float(ring.radius_mad),
         circularity=float(ring.circularity),
         confidence=float(confidence),
+        radius_min=float(radial_envelope.radius_min),
+        radius_max=float(radial_envelope.radius_max),
+        diameter_min=float(radial_envelope.diameter_min),
+        diameter_max=float(radial_envelope.diameter_max),
+        radial_spread=float(radial_envelope.radial_spread),
+        radial_spread_ratio=float(radial_envelope.radial_spread_ratio),
+        coarse_polygonal=bool(radial_envelope.coarse_polygonal),
+        radial_envelope=radial_envelope.to_dict(),
         diagnostics=diagnostics,
     )
 
@@ -741,6 +1082,16 @@ def _opening_measurement_to_dict(opening: BoreOpeningMeasurement | None) -> dict
         "axis": opening.axis,
         "radius": float(opening.radius),
         "diameter": float(opening.diameter),
+        "radius_min": float(opening.radius_min if opening.radius_min is not None else opening.radius),
+        "radius_nominal": float(opening.radius),
+        "radius_max": float(opening.radius_max if opening.radius_max is not None else opening.radius),
+        "diameter_min": float(opening.diameter_min if opening.diameter_min is not None else opening.diameter),
+        "diameter_nominal": float(opening.diameter),
+        "diameter_max": float(opening.diameter_max if opening.diameter_max is not None else opening.diameter),
+        "radial_spread": float(opening.radial_spread if opening.radial_spread is not None else 0.0),
+        "radial_spread_ratio": float(opening.radial_spread_ratio if opening.radial_spread_ratio is not None else 0.0),
+        "coarse_polygonal": bool(opening.coarse_polygonal),
+        "radial_envelope": dict(opening.radial_envelope or {}),
         "closed": bool(opening.closed),
         "near_closed": bool(opening.near_closed),
         "endpoint_gap_ratio": float(opening.endpoint_gap_ratio),
@@ -1888,6 +2239,12 @@ def _opening_measurement_from_ring_edges(
         0.0,
         1.0,
     )
+    radial_envelope = _measure_opening_radial_envelope(
+        vertices=vertices,
+        measurement_edges=measurement_edges,
+        selected_vertices=selected_vertices,
+        ring=ring,
+    )
     diagnostics = {
         "mode": "bore_opening_candidate_measurement",
         "input_edge_count": int(input_edge_count),
@@ -1896,6 +2253,16 @@ def _opening_measurement_from_ring_edges(
         "median_edge_length": float(median_edge_length),
         "axis_hint": axis_hint(ring.axis),
         "ring_fit": dict(ring.diagnostics),
+        "radial_envelope": radial_envelope.to_dict(),
+        "radius_min": float(radial_envelope.radius_min),
+        "radius_nominal": float(radial_envelope.radius_nominal),
+        "radius_max": float(radial_envelope.radius_max),
+        "diameter_min": float(radial_envelope.diameter_min),
+        "diameter_nominal": float(radial_envelope.diameter_nominal),
+        "diameter_max": float(radial_envelope.diameter_max),
+        "radial_spread": float(radial_envelope.radial_spread),
+        "radial_spread_ratio": float(radial_envelope.radial_spread_ratio),
+        "coarse_polygonal": bool(radial_envelope.coarse_polygonal),
         "graph": {k: v for k, v in graph.items() if k != "endpoint_vertices"},
     }
     if extra_diagnostics:
@@ -1923,6 +2290,14 @@ def _opening_measurement_from_ring_edges(
         radius_mad=float(ring.radius_mad),
         circularity=float(ring.circularity),
         confidence=float(confidence),
+        radius_min=float(radial_envelope.radius_min),
+        radius_max=float(radial_envelope.radius_max),
+        diameter_min=float(radial_envelope.diameter_min),
+        diameter_max=float(radial_envelope.diameter_max),
+        radial_spread=float(radial_envelope.radial_spread),
+        radial_spread_ratio=float(radial_envelope.radial_spread_ratio),
+        coarse_polygonal=bool(radial_envelope.coarse_polygonal),
+        radial_envelope=radial_envelope.to_dict(),
         diagnostics=diagnostics,
     )
 
@@ -2006,6 +2381,7 @@ def _face_normals(mesh: trimesh.Trimesh, vertices: np.ndarray, faces: np.ndarray
 
 __all__ = [
     "EdgeKey",
+    "BoreOpeningRadialEnvelope",
     "BoreOpeningMeasurement",
     "BoreRegionMeasurement",
     "BoreTwoOpeningMeasurement",

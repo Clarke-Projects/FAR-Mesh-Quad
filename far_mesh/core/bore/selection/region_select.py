@@ -1,14 +1,16 @@
 """Clean Bore region selection.
 
-This module is a closed, neutral selection entity for the BoreTool.
+This module is a closed, neutral selection entity for the BoreTool.  It
+translates the user's intent of selecting a feature rim/opening into a neutral
+RegionData/AOI package for later stages.
 
 Its job is deliberately narrow:
 
     selected edge / rim evidence
-        -> infer a circular-ish opening frame
+        -> infer a circular-ish opening frame for AOI construction
         -> project a finite volume into the mesh
         -> collect RegionData from that volume
-        -> hand RegionData to Recognition
+        -> hand RegionData and diagnostics to Recognition
 
 It does not recognize features, split borehole/chamfer/pocket surfaces, choose a
 "bore side", find rebuild targets, or authorize deletion.  Recognition owns
@@ -22,16 +24,16 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import math
 import numpy as np
 import trimesh
 
-from .geometry import canonical_axis
-from .types import RegionData
-from .measure import measure_bore_opening_candidates
-from .topology import (
+from ..geometry import canonical_axis
+from ..types import RegionData
+from ..measure import measure_bore_opening_candidates
+from ..topology import (
     boundary_edges_for_face_patch as _topology_boundary_edges_for_face_patch,
     connected_edge_components as _topology_connected_edge_components,
     face_edges as _topology_face_edges,
@@ -198,12 +200,21 @@ def normalize_opening_rim_edge_ids_from_arrays(
 
     out_ids = tuple(int(v) for v in tuple(rim_ids or raw_ids) if 0 <= int(v) < len(edge_arr))
     quality = _edge_cloud_graph_quality(rim_edges or selected_edges, verts)
+    opening_ledger = _opening_evidence_ledger_dict_from_arrays(
+        vertices=verts,
+        edge_index_to_vertices=edge_arr,
+        edge_ids=out_ids,
+        source="region_select.normalize_opening_rim_edge_ids_from_arrays",
+    )
     return out_ids, {
         **dict(diag or {}),
         "authority": "region_select_neutral_opening_rim",
         "raw_selected_edge_count": int(len(raw_ids)),
         "normalized_edge_count": int(len(out_ids)),
         "normalized_edge_graph_quality": quality,
+        "opening_evidence_ledger": opening_ledger,
+        "mesh_realization_evidence_ledger": opening_ledger,
+        "opening_footprint_authority": dict((opening_ledger.get("selected_authority", {}) if isinstance(opening_ledger, dict) else {}) or {}),
         "not_feature_recognition": True,
     }
 
@@ -219,6 +230,118 @@ def _face_normals_from_arrays(vertices: np.ndarray, faces: np.ndarray) -> np.nda
     out[valid] = raw[valid] / length[valid].reshape(-1, 1)
     return out
 
+
+
+def _opening_evidence_ledger_dict_from_arrays(
+    *,
+    vertices: np.ndarray,
+    edge_index_to_vertices: np.ndarray,
+    edge_ids: Iterable[int],
+    center: object | None = None,
+    axis: object | None = None,
+    radius: float | None = None,
+    source: str,
+    support_face_ids: Iterable[int] = (),
+) -> dict[str, object]:
+    """Return v120 mesh-realization opening evidence without feature meaning.
+
+    This helper is deliberately defensive.  Region Select may add its diagnostics
+    when available, but RegionData creation must not fail if the optional ledger
+    cannot be produced.
+    """
+
+    try:
+        from .mesh_realization import build_opening_evidence_ledger_from_arrays
+
+        ledger = build_opening_evidence_ledger_from_arrays(
+            vertices=vertices,
+            edge_index_to_vertices=edge_index_to_vertices,
+            selected_edge_ids=tuple(int(v) for v in tuple(edge_ids or ())),
+            center=center,
+            axis=axis,
+            radius=radius,
+            source=str(source),
+            support_face_ids=tuple(int(v) for v in tuple(support_face_ids or ()) if int(v) >= 0),
+        )
+        if ledger is None:
+            return {
+                "contract_type": "opening_evidence_ledger",
+                "semantic_stage": "mesh_realization_evidence_ledger",
+                "available": False,
+                "reason": "ledger_builder_returned_none",
+                "not_feature_identity": True,
+                "not_surface_ownership": True,
+                "not_rebuild_authority": True,
+            }
+        return ledger.to_dict()
+    except Exception as exc:
+        return {
+            "contract_type": "opening_evidence_ledger",
+            "semantic_stage": "mesh_realization_evidence_ledger",
+            "available": False,
+            "reason": "ledger_builder_failed",
+            "error": str(exc),
+            "not_feature_identity": True,
+            "not_surface_ownership": True,
+            "not_rebuild_authority": True,
+        }
+
+
+
+def _opening_probe_ledger_dict_from_region_arrays(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_normals: np.ndarray,
+    region_face_ids: Iterable[int],
+    seed_face_ids: Iterable[int],
+    selected_edge_ids: Iterable[int],
+    normalized_edge_ids: Iterable[int],
+    edge_index_to_vertices: np.ndarray,
+    center: object,
+    axis: object,
+    radius: float,
+    source: str,
+) -> dict[str, object]:
+    """Return X1-style local probe evidence without feature authority."""
+
+    try:
+        from .mesh_realization import build_x1_style_opening_probe_ledger_from_arrays
+
+        ledger = build_x1_style_opening_probe_ledger_from_arrays(
+            vertices=vertices,
+            faces=faces,
+            face_normals=face_normals,
+            region_face_ids=tuple(int(v) for v in tuple(region_face_ids or ()) if int(v) >= 0),
+            seed_face_ids=tuple(int(v) for v in tuple(seed_face_ids or ()) if int(v) >= 0),
+            selected_edge_ids=tuple(int(v) for v in tuple(selected_edge_ids or ()) if int(v) >= 0),
+            normalized_edge_ids=tuple(int(v) for v in tuple(normalized_edge_ids or ()) if int(v) >= 0),
+            edge_index_to_vertices=edge_index_to_vertices,
+            center=center,
+            axis=axis,
+            radius=float(radius),
+            source=str(source),
+        )
+        if ledger is None:
+            return {
+                "contract_type": "x1_style_opening_probe_ledger",
+                "available": False,
+                "reason": "probe_ledger_builder_returned_none",
+                "not_feature_identity": True,
+                "not_surface_ownership": True,
+                "not_rebuild_authority": True,
+            }
+        return dict(ledger)
+    except Exception as exc:
+        return {
+            "contract_type": "x1_style_opening_probe_ledger",
+            "available": False,
+            "reason": "probe_ledger_builder_failed",
+            "error": str(exc),
+            "not_feature_identity": True,
+            "not_surface_ownership": True,
+            "not_rebuild_authority": True,
+        }
 
 
 def select_bore_region(mesh: trimesh.Trimesh, edge_ids: Iterable[int]) -> BoreRegionSelection:
@@ -287,10 +410,100 @@ def select_bore_region(mesh: trimesh.Trimesh, edge_ids: Iterable[int]) -> BoreRe
 
 
 
+def _normalize_selection_seed_metadata(
+    selection_metadata: Mapping[str, object] | None,
+    *,
+    edge_table: Mapping[str, object],
+    face_count: int,
+) -> dict[str, object]:
+    """Normalize host/viewport raw clicked-edge metadata for Region Select.
+
+    The raw selected edge cloud can be expanded/contaminated before BoreTool is
+    called.  This metadata preserves the primitive the operator actually clicked
+    so Region Select can keep rim completion local to that seed.
+    """
+
+    meta = dict(selection_metadata or {}) if isinstance(selection_metadata, Mapping) else {}
+    out: dict[str, object] = {
+        "available": False,
+        "contract": str(meta.get("metadata_contract", meta.get("contract", "")) or ""),
+    }
+    unique_edges = tuple(edge_table.get("unique_edges", ()) or ())
+    seed_edge_id: int | None = None
+    for key in ("seed_edge_id", "clicked_edge_id", "edge_id"):
+        if key in meta:
+            try:
+                value = int(meta.get(key))
+            except Exception:
+                continue
+            if 0 <= value < len(unique_edges):
+                seed_edge_id = value
+                break
+    if seed_edge_id is not None:
+        edge_key = _normalize_edge(unique_edges[seed_edge_id])
+        out["available"] = True
+        out["seed_edge_id"] = int(seed_edge_id)
+        out["seed_edge_key"] = edge_key
+        out["seed_edge_vertex_ids"] = tuple(int(v) for v in edge_key)
+        edge_to_faces = edge_table.get("edge_to_faces", {})
+        faces_for_edge: tuple[int, ...] = ()
+        if isinstance(edge_to_faces, Mapping):
+            try:
+                faces_for_edge = tuple(
+                    int(v) for v in tuple(edge_to_faces.get(edge_key, ()) or ())
+                    if 0 <= int(v) < int(face_count)
+                )
+            except Exception:
+                faces_for_edge = ()
+        out["seed_adjacent_face_ids"] = faces_for_edge
+
+    try:
+        seed_faces = tuple(int(v) for v in tuple(meta.get("seed_adjacent_face_ids", ()) or ()))
+    except Exception:
+        seed_faces = ()
+    if seed_faces:
+        valid_seed_faces = tuple(sorted({int(v) for v in seed_faces if 0 <= int(v) < int(face_count)}))
+        if valid_seed_faces:
+            out["available"] = True
+            out["metadata_seed_adjacent_face_ids"] = valid_seed_faces
+            if not out.get("seed_adjacent_face_ids"):
+                out["seed_adjacent_face_ids"] = valid_seed_faces
+
+    try:
+        point_raw = tuple(float(v) for v in tuple(meta.get("seed_pick_point", ()) or ()))
+        if len(point_raw) >= 3:
+            out["seed_pick_point"] = (float(point_raw[0]), float(point_raw[1]), float(point_raw[2]))
+    except Exception:
+        pass
+
+    for key in ("selection_origin", "edge_region_strategy", "backend"):
+        if key in meta:
+            out[key] = meta.get(key)
+    return out
+
+
+def _seed_edge_component_subset(
+    *,
+    selected_edges: set[EdgeKey],
+    seed_edge: EdgeKey | None,
+) -> set[EdgeKey]:
+    if not selected_edges or seed_edge is None:
+        return set()
+    seed = _normalize_edge(seed_edge)
+    if seed not in selected_edges:
+        return {seed}
+    for comp in _topology_connected_edge_components(set(selected_edges)):
+        comp_set = {_normalize_edge(edge) for edge in comp}
+        if seed in comp_set:
+            return set(comp_set)
+    return {seed}
+
+
 def select_region_data(
     mesh: trimesh.Trimesh,
     edge_ids: Iterable[int],
     *,
+    selection_metadata: Mapping[str, object] | None = None,
     # Configuration parameters control RegionData collection. They are not
     # feature-recognition gates.
     max_normal_axis_dot: float = 0.72,
@@ -334,6 +547,11 @@ def select_region_data(
     vertices = _mesh_vertices(mesh)
     faces = _mesh_faces(mesh)
     edge_table = _build_edge_table(mesh)
+    seed_metadata = _normalize_selection_seed_metadata(
+        selection_metadata,
+        edge_table=edge_table,
+        face_count=len(faces),
+    )
     selected_edges, invalid_edge_ids = _edge_ids_to_keys(selected_edge_ids, edge_table)
     if not selected_edges:
         raise ValueError(
@@ -342,6 +560,26 @@ def select_region_data(
         )
 
     selected_edge_set = set(selected_edges)
+    true_seed_edge = seed_metadata.get("seed_edge_key") if bool(seed_metadata.get("available", False)) else None
+    true_seed_edge_key = _normalize_edge(true_seed_edge) if isinstance(true_seed_edge, tuple) and len(true_seed_edge) >= 2 else None
+    seed_component_edges = _seed_edge_component_subset(
+        selected_edges=selected_edge_set,
+        seed_edge=true_seed_edge_key,
+    )
+    rim_input_edges = set(selected_edge_set)
+    rim_input_edge_ids = tuple(selected_edge_ids)
+    seed_local_guard_used = False
+    if true_seed_edge_key is not None and len(selected_edge_set) > max(24, int(min_bore_loop_edges) * 2):
+        # For polluted automatic Ctrl-click clouds, use the actual clicked edge
+        # as rim-completion authority.  The expanded cloud remains diagnostics
+        # and AOI context, but it no longer chooses a remote normalized ring.
+        rim_input_edges = set(seed_component_edges or {true_seed_edge_key})
+        edge_key_to_id = edge_table.get("edge_key_to_id", {})
+        if isinstance(edge_key_to_id, Mapping):
+            ids = _edge_ids_from_keys(rim_input_edges, edge_key_to_id)
+            if ids:
+                rim_input_edge_ids = tuple(int(v) for v in ids)
+        seed_local_guard_used = True
     selected_vertex_ids = tuple(sorted({int(v) for edge in selected_edge_set for v in edge}))
     loops = _selected_edges_to_ordered_loops(selected_edge_ids, edge_table)
     loop_count = int(len(loops))
@@ -359,8 +597,8 @@ def select_region_data(
     # single picked feature edge.
     rim_edges, rim_edge_ids, rim_diag = _opening_rim_edges_from_selection(
         mesh=mesh,
-        selected_edges=selected_edge_set,
-        selected_edge_ids=selected_edge_ids,
+        selected_edges=rim_input_edges,
+        selected_edge_ids=rim_input_edge_ids,
         edge_table=edge_table,
         vertices=vertices,
         faces=faces,
@@ -368,8 +606,8 @@ def select_region_data(
         min_loop_edges=max(3, int(min_bore_loop_edges)),
     )
     if not rim_edges:
-        rim_edges = set(selected_edge_set)
-        rim_edge_ids = tuple(selected_edge_ids)
+        rim_edges = set(rim_input_edges or selected_edge_set)
+        rim_edge_ids = tuple(rim_input_edge_ids or selected_edge_ids)
         rim_diag = {**rim_diag, "fallback_used": True, "fallback_reason": "empty_inferred_rim_use_raw_selected_edges"}
 
     rim_vertex_ids = tuple(sorted({int(v) for edge in rim_edges for v in edge})) or selected_vertex_ids
@@ -379,7 +617,10 @@ def select_region_data(
         edge_to_faces=edge_to_faces,
         face_count=len(faces),
     )
-    if len(raw_seed_faces) < max(1, int(min_bore_seed_faces)):
+    true_seed_faces = tuple(int(v) for v in tuple(seed_metadata.get("seed_adjacent_face_ids", ()) or ()))
+    if true_seed_faces:
+        raw_seed_faces = tuple(sorted(set(true_seed_faces)))
+    elif len(raw_seed_faces) < max(1, int(min_bore_seed_faces)):
         raw_seed_faces = tuple(sorted(set(raw_seed_faces) | set(_seed_faces_from_vertices(faces, selected_vertex_ids))))
 
     seed_faces = _seed_faces_from_selected_edges(
@@ -487,10 +728,39 @@ def select_region_data(
         "reason": "clean selector projects a measured volume cutout and does not use feature/normal/side gates",
     }
 
+    opening_ledger = _opening_evidence_ledger_dict_from_arrays(
+        vertices=vertices,
+        edge_index_to_vertices=np.asarray(tuple(edge_table.get("unique_edges", ()) or ()), dtype=np.int64),
+        edge_ids=tuple(int(v) for v in tuple(rim_edge_ids)),
+        center=center_arr,
+        axis=axis_arr,
+        radius=float(radius_value),
+        source="region_select.select_region_data.opening_mesh_realization",
+        support_face_ids=tuple(sorted(seed_faces)),
+    )
+    opening_authority = dict((opening_ledger.get("selected_authority", {}) if isinstance(opening_ledger, dict) else {}) or {})
+    mesh_realization_assessment = dict((opening_ledger.get("mesh_realization_assessment", {}) if isinstance(opening_ledger, dict) else {}) or {})
+    opening_probe_ledger = _opening_probe_ledger_dict_from_region_arrays(
+        vertices=vertices,
+        faces=faces,
+        face_normals=face_normals,
+        region_face_ids=tuple(sorted(face_ids)),
+        seed_face_ids=tuple(sorted(seed_faces)),
+        selected_edge_ids=tuple(int(v) for v in tuple(selected_edge_ids)),
+        normalized_edge_ids=tuple(int(v) for v in tuple(rim_edge_ids)),
+        edge_index_to_vertices=np.asarray(tuple(edge_table.get("unique_edges", ()) or ()), dtype=np.int64),
+        center=center_arr,
+        axis=axis_arr,
+        radius=float(radius_value),
+        source="region_select.select_region_data.x1_style_probe_reanalysis",
+    )
+
     diagnostics: dict[str, object] = {
-        "pipeline_stage": "region_select_cylindrical_region_data_evidence",
-        "mode": "selected_edge_opening_to_cylindrical_region_data_cutout",
-        "selection_contract": "edge_opening_to_measured_cylindrical_region_data_no_feature_bias",
+        "pipeline_stage": "region_select_selected_annular_rail_region_data_evidence",
+        "mode": "selected_edge_annular_rail_to_neutral_region_data_cutout",
+        "legacy_mode_alias": "selected_edge_opening_to_cylindrical_region_data_cutout",
+        "selection_contract": "selected_edges_to_neutral_annular_rail_region_data_no_feature_bias",
+        "selected_annular_rail_contract_v173d": "selected_edges_are_neutral_annular_rail_evidence_not_bore_opening_authority",
         "semantic_role": "neutral_region_data_cutout_only",
         "feature_authority": False,
         "recognition_authority": False,
@@ -510,6 +780,18 @@ def select_region_data(
         "closed_loop_count": int(closed_loop_count),
         "primary_anchor_edge_count": int(len(rim_edges)),
         "raw_non_anchor_edge_count": int(max(0, len(selected_edge_set) - len(rim_edges))),
+        "true_seed_metadata_available": bool(seed_metadata.get("available", False)),
+        "true_seed_edge_id": seed_metadata.get("seed_edge_id", -1),
+        "true_seed_adjacent_face_ids": tuple(int(v) for v in tuple(seed_metadata.get("seed_adjacent_face_ids", ()) or ())),
+        "seed_local_rim_guard": {
+            "used": bool(seed_local_guard_used),
+            "source": "viewport_click_seed_primitive_v143" if bool(seed_metadata.get("available", False)) else "unavailable",
+            "raw_selected_edge_count": int(len(selected_edge_set)),
+            "rim_input_edge_count": int(len(rim_input_edges)),
+            "seed_component_edge_count": int(len(seed_component_edges)),
+            "rim_output_edge_count": int(len(rim_edges)),
+            "rim_seed_edge_overlap": int(1 if true_seed_edge_key is not None and true_seed_edge_key in set(rim_edges) else 0),
+        },
         "volumetric_anchor_policy": "picked_or_inferred_rim_projected_as_cylindrical_region_data",
         "raw_adjacent_face_count": int(len(raw_seed_faces)),
         "direct_selected_edge_adjacent_face_count": int(len(raw_seed_faces)),
@@ -523,6 +805,14 @@ def select_region_data(
         "frame_measurement": dict(measured_frame_diag),
         "best_opening_candidate": _opening_candidate_summary(best_opening_candidate),
         "opening_rim_inference": dict(rim_diag),
+        "opening_evidence_ledger": opening_ledger,
+        "mesh_realization_evidence_ledger": opening_ledger,
+        "opening_footprint_authority": opening_authority,
+        "mesh_realization_assessment": mesh_realization_assessment,
+        "mesh_realization_contract": "evidence_only_between_region_select_and_recognition",
+        "opening_probe_ledger": opening_probe_ledger,
+        "x1_style_opening_probe_ledger": opening_probe_ledger,
+        "x1_probe_reanalysis_used": bool(isinstance(opening_probe_ledger, dict) and opening_probe_ledger.get("available", True) is not False),
         "median_selected_edge_length": float(median_edge_length),
         "volume_selection": dict(cylinder_diag),
         "cylindrical_region_data_projection": dict(cylinder_diag),
@@ -546,6 +836,8 @@ def select_region_data(
             "primary_region_face_ids": (),
             "seed_face_ids": tuple(sorted(seed_faces)),
             "direct_selected_edge_adjacent_face_ids": tuple(sorted(raw_seed_faces)),
+            "true_seed_edge_id": seed_metadata.get("seed_edge_id", -1),
+            "true_seed_adjacent_face_ids": tuple(int(v) for v in tuple(seed_metadata.get("seed_adjacent_face_ids", ()) or ())),
             "opening_rim_edge_ids": tuple(int(v) for v in tuple(rim_edge_ids)),
             "opening_rim_edges": tuple(sorted(rim_edges)),
             "vertex_ids": vertex_ids,
@@ -614,8 +906,8 @@ def _opening_rim_edges_from_selection(
 
     del mesh  # mesh object is intentionally not interpreted here; arrays/tables carry the neutral evidence.
 
-    selected = {_normalize_edge(edge) for edge in tuple(selected_edges or ())}
-    if not selected:
+    raw_selected = {_normalize_edge(edge) for edge in tuple(selected_edges or ())}
+    if not raw_selected:
         return set(), (), {"used": False, "reason": "empty_selected_edges"}
 
     edge_key_to_id = edge_table.get("edge_key_to_id", {})
@@ -624,36 +916,60 @@ def _opening_rim_edges_from_selection(
 
     min_edges = max(3, int(min_loop_edges))
     raw_ok, raw_quality = _edge_cloud_is_coherent_opening_rim(
-        selected,
+        raw_selected,
         vertices=vertices,
         min_loop_edges=min_edges,
     )
     if raw_ok:
-        ids = _edge_ids_from_keys(selected, edge_key_to_id) or tuple(selected_edge_ids)
-        return set(selected), ids, {
+        ids = _edge_ids_from_keys(raw_selected, edge_key_to_id) or tuple(selected_edge_ids)
+        return set(raw_selected), ids, {
             "used": True,
             "method": "raw_selected_edge_cloud_is_coherent_opening_rim",
-            "selected_edge_count": int(len(selected)),
-            "inferred_edge_count": int(len(selected)),
+            "selected_edge_count": int(len(raw_selected)),
+            "inferred_edge_count": int(len(raw_selected)),
             "single_pick_growth_used": False,
             "complete_circle_recovery_used": False,
             "raw_edge_cloud_quality": raw_quality,
+            "seed_local_rim_guard": {"used": False, "reason": "raw_cloud_already_coherent"},
             "not_feature_recognition": True,
         }
+
+    # v142: if the live selector gave us a polluted multi-component cloud, do
+    # not let every selected vertex become seed authority.  That was the coarse
+    # mesh failure mode: the normalizer could choose a geometrically plausible
+    # ring that did not belong to the user's local rim island.  Pick one raw
+    # selected component as the seed-owned opening island, then restrict rim
+    # completion and candidate scanning around that island.  Manual rim selection
+    # and clean meshes remain unchanged because they normally arrive as a single
+    # coherent component.
+    selected, seed_guard_diag = _choose_seed_local_raw_edge_component(
+        selected_edges=raw_selected,
+        selected_edge_ids=tuple(selected_edge_ids),
+        edge_table=edge_table,
+        vertices=vertices,
+        min_loop_edges=min_edges,
+    )
 
     candidate_edges = _feature_rim_candidate_edges(faces=faces, face_normals=face_normals, edge_table=edge_table)
     candidate_edges.update(selected)
 
     # Region Select owns neutral rim completion.  The visible Ctrl-click chain can
     # be only a short arc, and crease-only candidate edges can be fragmented on
-    # repaired/imported meshes.  For the final circular closure pass we therefore
-    # also allow every runtime mesh edge to be tested geometrically against the
-    # inferred opening frame.  This is not feature recognition: each edge still has
-    # to lie on the same local circle/plane and run tangentially around that circle.
+    # repaired/imported meshes.  For seed-owned polluted clouds, the final
+    # circular closure pass is limited to a spatial neighborhood of the chosen
+    # seed island instead of all runtime edges.  This prevents same-radius remote
+    # features from becoming the selected opening frame.
     all_scan_edges = {_normalize_edge(edge) for edge in tuple(edge_table.get("unique_edges", ()) or ())}
     all_scan_edges.update(candidate_edges)
     selected_vertices = {int(v) for edge in selected for v in edge}
     selected_mid = _edge_cloud_midpoint(vertices, selected)
+    all_scan_edges, scan_guard_diag = _seed_local_scan_edges(
+        vertices=vertices,
+        edges=all_scan_edges,
+        seed_edges=selected,
+        min_loop_edges=min_edges,
+        enabled=bool(seed_guard_diag.get("used")),
+    )
 
     components = tuple(_topology_connected_edge_components(candidate_edges))
     touching: list[set[EdgeKey]] = []
@@ -671,7 +987,9 @@ def _opening_rim_edges_from_selection(
             continue
         # If topology does not connect through the exact picked vertices, still
         # consider nearby crease/boundary components.  This covers repaired or
-        # imported meshes where the visible rim is split into many tiny arcs.
+        # imported meshes where the visible rim is split into many tiny arcs.  In
+        # the polluted-cloud case, selected_mid is the seed-owned island midpoint,
+        # not the midpoint of the whole 274-edge cloud.
         dist = _edge_cloud_distance_to_point(vertices, comp_set, selected_mid)
         if np.isfinite(dist) and dist <= search_distance:
             nearby.append(comp_set)
@@ -687,6 +1005,7 @@ def _opening_rim_edges_from_selection(
             "inferred_edge_count": int(len(selected)),
             "raw_edge_cloud_quality": raw_quality,
             "candidate_feature_edge_count": int(len(candidate_edges)),
+            "seed_local_rim_guard": {**dict(seed_guard_diag), "scan": dict(scan_guard_diag)},
             "not_feature_recognition": True,
         }
 
@@ -738,6 +1057,9 @@ def _opening_rim_edges_from_selection(
         "raw_edge_cloud_quality": raw_quality,
         "chosen_edge_cloud_quality": chosen_quality,
         "chosen_component_score": float(scored[0][0]),
+        "seed_local_rim_guard": {**dict(seed_guard_diag), "scan": dict(scan_guard_diag)},
+        "normalized_seed_edge_overlap": int(len(chosen & selected)),
+        "normalized_raw_edge_overlap": int(len(chosen & raw_selected)),
         "not_feature_recognition": True,
     }
 
@@ -855,6 +1177,175 @@ def _edge_cloud_is_coherent_opening_rim(edges: Iterable[EdgeKey], *, vertices: n
     quality = {**quality, "accepted_as_raw_opening_rim": bool(ok)}
     return bool(ok), quality
 
+
+
+
+def _choose_seed_local_raw_edge_component(
+    *,
+    selected_edges: set[EdgeKey],
+    selected_edge_ids: tuple[int, ...],
+    edge_table: Mapping[str, object],
+    vertices: np.ndarray,
+    min_loop_edges: int,
+) -> tuple[set[EdgeKey], dict[str, object]]:
+    """Choose one raw selected component as seed-owned opening evidence.
+
+    This is a conservative guard for contaminated live Ctrl-click selections.
+    It does not classify a feature.  It only prevents a broad raw edge cloud from
+    acting as one giant seed during rim normalization.
+    """
+
+    selected = {_normalize_edge(edge) for edge in tuple(selected_edges or ())}
+    components = tuple(_topology_connected_edge_components(selected))
+    if len(components) <= 1:
+        return set(selected), {
+            "used": False,
+            "reason": "raw_selection_single_component",
+            "raw_component_count": int(len(components)),
+            "seed_component_edge_count": int(len(selected)),
+        }
+
+    unique_edges = tuple(edge_table.get("unique_edges", ()) or ())
+    first_edge_key: EdgeKey | None = None
+    if selected_edge_ids:
+        try:
+            first_idx = int(tuple(selected_edge_ids)[0])
+            if 0 <= first_idx < len(unique_edges):
+                first_edge_key = _normalize_edge(unique_edges[first_idx])
+        except Exception:
+            first_edge_key = None
+
+    scored: list[tuple[float, set[EdgeKey], dict[str, object]]] = []
+    min_edges = max(3, int(min_loop_edges))
+    for idx, comp in enumerate(components):
+        comp_set = {_normalize_edge(edge) for edge in tuple(comp or ())}
+        if not comp_set:
+            continue
+        quality = _edge_cloud_graph_quality(comp_set, vertices)
+        edge_count = int(quality.get("edge_count", 0) or 0)
+        branch_count = int(quality.get("branch_vertex_count", 0) or 0)
+        endpoint_count = int(quality.get("open_endpoint_count", 0) or 0)
+        touches_first = bool(first_edge_key is not None and first_edge_key in comp_set)
+        frame = _fit_opening_rim_frame(vertices=vertices, edges=comp_set)
+        frame_score = 0.0
+        if frame is not None:
+            frame_score += max(0.0, 1.0 - min(float(frame.radius_rel_rms) / 0.35, 1.0)) * 750.0
+            frame_score += max(0.0, 1.0 - min(float(frame.plane_rel_rms) / 0.30, 1.0)) * 300.0
+        score = 0.0
+        if bool(quality.get("closed", False)):
+            score += 6500.0
+        elif bool(quality.get("near_closed", False)):
+            score += 3800.0
+        if edge_count >= min_edges:
+            score += 700.0
+        score += min(edge_count, min_edges * 4) * 35.0
+        score += frame_score
+        score += 1200.0 if touches_first else 0.0
+        score -= branch_count * 600.0
+        score -= max(0, endpoint_count - 2) * 120.0
+        scored.append((float(score), set(comp_set), {
+            "index": int(idx),
+            "score": float(score),
+            "edge_count": int(edge_count),
+            "touches_first_selected_edge": bool(touches_first),
+            "closed": bool(quality.get("closed", False)),
+            "near_closed": bool(quality.get("near_closed", False)),
+            "branch_vertex_count": int(branch_count),
+            "open_endpoint_count": int(endpoint_count),
+            "frame_fit_available": bool(frame is not None),
+            "frame_radius_rel_rms": float(getattr(frame, "radius_rel_rms", 0.0) if frame is not None else 0.0),
+            "frame_plane_rel_rms": float(getattr(frame, "plane_rel_rms", 0.0) if frame is not None else 0.0),
+        }))
+
+    if not scored:
+        return set(selected), {
+            "used": False,
+            "reason": "no_scoreable_raw_components",
+            "raw_component_count": int(len(components)),
+            "seed_component_edge_count": int(len(selected)),
+        }
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    chosen_score, chosen, chosen_diag = scored[0]
+    return set(chosen), {
+        "used": True,
+        "reason": "contaminated_multi_component_raw_selection_seed_island_chosen",
+        "raw_selected_edge_count": int(len(selected)),
+        "raw_component_count": int(len(components)),
+        "seed_component_edge_count": int(len(chosen)),
+        "seed_component_fraction": float(len(chosen)) / max(float(len(selected)), 1.0),
+        "selected_component_score": float(chosen_score),
+        "selected_component": dict(chosen_diag),
+        "candidate_component_summaries": tuple(item[2] for item in scored[:8]),
+        "not_feature_recognition": True,
+    }
+
+
+def _seed_local_scan_edges(
+    *,
+    vertices: np.ndarray,
+    edges: Iterable[EdgeKey],
+    seed_edges: Iterable[EdgeKey],
+    min_loop_edges: int,
+    enabled: bool,
+) -> tuple[set[EdgeKey], dict[str, object]]:
+    """Restrict same-circle scanning to a seed-owned spatial neighborhood."""
+
+    edge_set = {_normalize_edge(edge) for edge in tuple(edges or ())}
+    seed_set = {_normalize_edge(edge) for edge in tuple(seed_edges or ())}
+    if not enabled or not edge_set or not seed_set:
+        return set(edge_set), {
+            "used": False,
+            "reason": "disabled_or_empty",
+            "input_edge_count": int(len(edge_set)),
+            "output_edge_count": int(len(edge_set)),
+        }
+
+    verts = np.asarray(vertices, dtype=float)
+    seed_mid = _edge_cloud_midpoint(verts, seed_set)
+    seed_len = _median_edge_length(verts, seed_set)
+    frame = _fit_opening_rim_frame(vertices=verts, edges=seed_set)
+    if frame is not None and float(frame.radius) > 0.0:
+        max_distance = max(float(frame.radius) * 2.75, float(seed_len) * 36.0, 1.0e-6)
+        reason = "seed_frame_radius_neighborhood"
+    else:
+        max_distance = max(float(seed_len) * 48.0, 1.0e-6)
+        reason = "seed_edge_length_neighborhood"
+
+    seed_vertices = {int(v) for edge in seed_set for v in edge}
+    out: set[EdgeKey] = set(seed_set)
+    for edge in edge_set:
+        if edge in seed_set:
+            continue
+        a, b = edge
+        if int(a) in seed_vertices or int(b) in seed_vertices:
+            out.add(edge)
+            continue
+        if _edge_cloud_distance_to_point(verts, (edge,), seed_mid) <= max_distance:
+            out.add(edge)
+
+    # Never make the scan so small that a single manually selected partial rim
+    # cannot be completed; fall back to the original set if the neighborhood is
+    # unusably tiny.
+    if len(out) < max(3, int(min_loop_edges)):
+        return set(edge_set), {
+            "used": False,
+            "reason": "seed_local_scan_too_small_fallback_global",
+            "input_edge_count": int(len(edge_set)),
+            "output_edge_count": int(len(edge_set)),
+            "attempted_output_edge_count": int(len(out)),
+            "max_distance": float(max_distance),
+        }
+
+    return set(out), {
+        "used": True,
+        "reason": reason,
+        "input_edge_count": int(len(edge_set)),
+        "output_edge_count": int(len(out)),
+        "seed_edge_count": int(len(seed_set)),
+        "max_distance": float(max_distance),
+        "seed_midpoint": _to_vector3(seed_mid),
+    }
 
 
 def _score_opening_rim_component(

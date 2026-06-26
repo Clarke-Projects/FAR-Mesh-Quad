@@ -1,4 +1,11 @@
-# far_mesh/viewer/wgpu_viewport.py
+"""WGPU viewport implementation.
+
+The viewport is a picking and display backend.  It may resolve the primitive
+under the pointer and forward a generic edge-region strategy to the core
+selection layer, but it does not own feature semantics.  BoreTool-specific
+meaning starts after selection evidence is handed to the controller/tool stack.
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -406,6 +413,7 @@ class WgpuViewport(QWidget):
         self._hover_face: int | None = None
         self._last_picked_world_pos: tuple[float, float, float] | None = None
         self._last_hover_pick_info: dict[str, Any] | None = None
+        self._last_edge_pick_seed: dict[str, Any] = {}
 
         self._show_edges = self.config.show_edges_default
         self._edge_width = self.config.edge_width_default
@@ -1559,10 +1567,59 @@ class WgpuViewport(QWidget):
 
         self.highlight_points(sorted(selected))
 
+    def _edge_pick_seed_payload(
+        self,
+        edge_index: int,
+        *,
+        modifiers: set[str] | None = None,
+        brush_drag: bool = False,
+    ) -> dict[str, Any]:
+        """Preserve the primitive the operator actually clicked.
+
+        BoreTool/Region Select need this seed before ``bore_rim`` expansion turns
+        a single click into a connected edge cloud.  This payload is not feature
+        identity; it is raw pick evidence for seed-local rim normalization.
+        """
+
+        payload: dict[str, Any] = {
+            "metadata_contract": "viewport_click_seed_primitive_v143",
+            "backend": self.BACKEND_NAME,
+            "selection_origin": "edge_pick_before_region_expansion",
+            "seed_edge_id": int(edge_index),
+            "clicked_edge_id": int(edge_index),
+            "edge_region_strategy": str(self._edge_region_strategy),
+            "brush_drag": bool(brush_drag),
+            "modifiers": tuple(sorted(str(v) for v in (modifiers or set()))),
+        }
+        try:
+            if self._edge_index_to_vertices is not None and 0 <= int(edge_index) < len(self._edge_index_to_vertices):
+                a, b = self._edge_index_to_vertices[int(edge_index)]
+                edge_vertices = (int(a), int(b))
+                payload["seed_edge_vertex_ids"] = edge_vertices
+                key = tuple(sorted(edge_vertices))
+                faces = ()
+                try:
+                    if isinstance(self._edge_to_faces, dict):
+                        faces = tuple(int(v) for v in self._edge_to_faces.get(key, ()))
+                except Exception:
+                    faces = ()
+                payload["seed_adjacent_face_ids"] = faces
+        except Exception:
+            pass
+        if self._last_picked_world_pos is not None:
+            payload["seed_pick_point"] = tuple(float(v) for v in self._last_picked_world_pos)
+        return payload
+
     def _get_connected_edge_region(self, start_edge_index: int) -> Set[int]:
         if self._current_vertices is None or self._edge_index_to_vertices is None:
             return set()
         try:
+            strategy = str(getattr(self, "_edge_region_strategy", "safe") or "safe")
+            # v173l: Bore opening Ctrl/Cmd-click must never expose the broad raw
+            # connected edge cloud to the viewport, but the cap must not break
+            # fine/high-resolution openings with many small segments.  The
+            # measured-annular-rail guard in selection_edges validates circularity
+            # and loop-like topology; this value is only a live traversal safety cap.
             region = select_edge_region(
                 vertices=self._current_vertices,
                 faces=self._current_faces,
@@ -1570,7 +1627,8 @@ class WgpuViewport(QWidget):
                 edge_to_faces=self._edge_to_faces,
                 open_edges=self._open_edges,
                 start_edge_index=int(start_edge_index),
-                strategy=self._edge_region_strategy,
+                strategy=strategy,
+                max_selected_edges=(768 if strategy == "bore_rim" else None),
             )
             return {int(v) for v in region.edge_ids}
         except Exception as exc:
@@ -1585,6 +1643,12 @@ class WgpuViewport(QWidget):
         if edge_index < 0 or edge_index >= len(self._edge_index_to_vertices):
             return
 
+        self._last_edge_pick_seed = self._edge_pick_seed_payload(
+            int(edge_index),
+            modifiers=modifiers,
+            brush_drag=brush_drag,
+        )
+
         selected = set(self._selected_edge_ids)
         ctrl_pressed = bool({"Ctrl", "Control", "Meta"} & modifiers)
         shift_pressed = "Shift" in modifiers
@@ -1596,6 +1660,7 @@ class WgpuViewport(QWidget):
                     selected.difference_update(region)
                 else:
                     selected.update(region)
+                self._last_edge_pick_seed["expanded_edge_count"] = int(len(selected))
                 self.highlight_edges(sorted(selected))
                 return
 
@@ -1609,6 +1674,7 @@ class WgpuViewport(QWidget):
         else:
             selected = {int(edge_index)}
 
+        self._last_edge_pick_seed["expanded_edge_count"] = int(len(selected))
         self.highlight_edges(sorted(selected))
 
     @staticmethod
@@ -1657,6 +1723,15 @@ class WgpuViewport(QWidget):
             edge_index = self._resolve_edge_index_from_pick_info(info)
             if edge_index is None:
                 return
+
+            face_index = info.get("face_index") if isinstance(info, dict) else None
+            if face_index is None and isinstance(getattr(self, "_last_hover_pick_info", None), dict):
+                face_index = self._last_hover_pick_info.get("face_index")
+            if face_index is not None:
+                try:
+                    self._update_pick_world_pos_from_face(int(face_index), info if isinstance(info, dict) else {})
+                except Exception:
+                    pass
 
             self._apply_edge_pick(int(edge_index), modifiers)
             face_index = info.get("face_index") if isinstance(info, dict) else None
@@ -1832,6 +1907,7 @@ class WgpuViewport(QWidget):
         self._hover_face = None
         self._last_picked_world_pos = None
         self._last_hover_pick_info = None
+        self._last_edge_pick_seed = {}
         self._reset_brush_drag()
 
         # Keep CPU-side topology available even when the real WGPU scene is not
@@ -1951,6 +2027,7 @@ class WgpuViewport(QWidget):
             "selected_edge_ids": sorted(int(v) for v in self._selected_edge_ids),
             "edge_region_strategy": self._edge_region_strategy,
             "last_picked_world_pos": self._last_picked_world_pos,
+            "edge_pick_seed": dict(self._last_edge_pick_seed or {}),
             "brush_select_enabled": self._brush_select_enabled,
         }
 
@@ -2338,10 +2415,11 @@ class WgpuViewport(QWidget):
     def set_edge_region_strategy(self, strategy: str | None) -> None:
         """Set the generic core edge-region strategy used for Ctrl/Cmd edge expansion.
 
-        The viewport does not implement Bore/rim logic. It stores this string and
-        passes it through to ``core.selection_edges.select_edge_region(...)`` when
-        Ctrl/Cmd-clicking an edge. Normal tools use ``safe``; Bore tools may request
-        ``bore_rim`` or ``ring``.
+        The viewport does not implement Recognition, ownership, or rebuild
+        logic. It stores this string and passes it through to
+        ``core.selection_edges.select_edge_region(...)`` when Ctrl/Cmd-clicking
+        an edge. Normal tools use ``safe``; Bore tools may request ``bore_rim``
+        for local rim evidence.
         """
 
         value = str(strategy or "safe").strip().lower()
@@ -2361,6 +2439,7 @@ class WgpuViewport(QWidget):
         self._selected_edge_ids.clear()
         self._last_picked_world_pos = None
         self._last_hover_pick_info = None
+        self._last_edge_pick_seed = {}
         self._reset_brush_drag()
         self._rebuild_selection_overlay()
         self._rebuild_point_selection_overlay()

@@ -1,4 +1,21 @@
-# far_mesh/core/selection_edges.py
+"""Selection-domain edge expansion and live rim-evidence helpers.
+
+This module belongs to the host selection layer, not to Bore Recognition.
+It converts viewport picks and controller edge-selection intent into compact,
+existing mesh edge IDs.  In Bore ``bore_rim`` mode it may resolve a local
+clicked rim/opening evidence set, but it must not classify BORE/POCKET/CHAMFER,
+assign surface ownership, build CandidateData, authorize rebuild, or mutate
+mesh topology.
+
+Semantic boundary:
+    viewport click / conservative edge cloud
+    -> selection-domain edge evidence
+    -> optional compact local rim evidence for BoreTool
+
+The returned IDs are visual/tool-input evidence only.  Region Select,
+Recognition, RebuildTarget, and Rebuild own their later semantic stages.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,7 +36,12 @@ class EdgeSelectionRegion:
 
 @dataclass(frozen=True)
 class BoreRimSelection:
-    """Result of bore‑aware rim selection from a clicked edge."""
+    """Selection-layer result for a compact user-indicated rim.
+
+    This is not feature identity and not rebuild authority.  It is the
+    selection stack's best local edge evidence for the rim/opening the user
+    indicated with the active click.
+    """
     rim_edge_ids: tuple[int, ...]
     opposite_edge_ids: tuple[int, ...] = ()
     confidence: float = 0.0
@@ -44,11 +66,12 @@ def select_bore_rim_loop(
     max_radius_ratio: float = 1.15,
     min_loop_edges: int = 12,
 ) -> BoreRimSelection:
-    """Bore‑specific rim loop selection.
+    """Return compact rim/opening edge evidence for a BoreTool session.
 
-    Uses the aggressive ring strategy (sibling chains, gap bridging) to recover
-    the full bore rim from a single clicked edge, even on messy triangulations.
-    Also attempts to find the opposite rim for through‑bores.
+    This helper is still a selection operation.  It asks the ``bore_rim``
+    strategy for a local, user-click-rooted rim evidence set and then measures
+    that set for UI/tool handoff.  It does not decide feature identity, own
+    wall faces, or authorize rebuild.
     """
     # First get the main rim using ring strategy
     result = select_edge_region(
@@ -1009,27 +1032,70 @@ def _estimate_confidence(mode, selected_count, connected_open_count, frame, star
 
 
 
-def _region_select_authoritative_bore_rim(
+def _rim_resolver_bore_rim_from_safe_selection(
     *,
     vertices: np.ndarray,
     faces: np.ndarray | None,
     edge_arr: np.ndarray,
     edge_faces: Mapping[EdgeKey, list[int] | tuple[int, ...]] | None,
+    selected_edge_ids: tuple[int, ...],
     start_edge_index: int,
     min_loop_edges: int,
-) -> tuple[tuple[int, ...], dict[str, object]] | None:
-    """Delegate Bore rim completion to Region Select without GUI authority.
+    max_output_edges: int,
+):
+    """Run the active clicked-edge rim resolver.
 
-    This is deliberately a small bridge.  The geometric meaning transform lives
-    in ``far_mesh.core.bore.region_select`` so BoreTool owns the neutral rim
-    interpretation.  ``selection_edges.py`` only uses the returned edge IDs so
-    the live Ctrl-click selection can display the same complete rim that Region
-    Select will later use for RegionData.
+    This helper deliberately lives in ``selection_edges.py`` because it is live
+    selection plumbing, not Recognition.  The resolver itself remains in
+    ``core.bore.rim_resolver`` and returns compact existing mesh edge IDs only.
+    Its output is local rim evidence rooted at the clicked primitive.
     """
 
-    if start_edge_index < 0 or start_edge_index >= len(edge_arr):
-        return None
     if faces is None:
+        return None
+    try:
+        from .bore.rim_resolver import resolve_bore_rim_edges_from_click_arrays
+    except Exception:
+        return None
+    try:
+        return resolve_bore_rim_edges_from_click_arrays(
+            vertices=vertices,
+            faces=faces,
+            edge_index_to_vertices=edge_arr,
+            edge_to_faces=edge_faces,
+            selected_edge_ids=tuple(int(v) for v in tuple(selected_edge_ids or ())),
+            start_edge_index=int(start_edge_index),
+            min_loop_edges=int(min_loop_edges),
+            max_output_edges=int(max_output_edges),
+        )
+    except Exception:
+        return None
+
+
+def _region_select_authoritative_bore_rim_from_edge_ids(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray | None,
+    edge_arr: np.ndarray,
+    edge_faces: Mapping[EdgeKey, list[int] | tuple[int, ...]] | None,
+    selected_edge_ids: tuple[int, ...],
+    min_loop_edges: int,
+    require_reduction: bool = False,
+) -> tuple[tuple[int, ...], dict[str, object]] | None:
+    """Ask Region Select to normalize visual rim evidence when explicitly needed.
+
+    This compatibility bridge is evidence-only.  It may ask Region Select for
+    neutral opening/rim edge IDs so the live selection can display a complete
+    rim, but the return value is still only selection-domain edge evidence.
+
+    The primary ``bore_rim`` path must stay rooted at the clicked-edge resolver;
+    broad visual clouds must not become feature or rebuild authority.
+    """
+
+    if faces is None:
+        return None
+    raw_ids = tuple(sorted({int(v) for v in tuple(selected_edge_ids or ()) if 0 <= int(v) < len(edge_arr)}))
+    if not raw_ids:
         return None
     try:
         from .bore.region_select import normalize_opening_rim_edge_ids_from_arrays
@@ -1041,15 +1107,289 @@ def _region_select_authoritative_bore_rim(
             faces=faces,
             edge_index_to_vertices=edge_arr,
             edge_to_faces=edge_faces,
-            selected_edge_ids=(int(start_edge_index),),
+            selected_edge_ids=raw_ids,
             min_loop_edges=int(min_loop_edges),
         )
-    except Exception as exc:
+    except Exception:
         return None
     rim_ids = tuple(sorted({int(v) for v in tuple(rim_ids or ()) if 0 <= int(v) < len(edge_arr)}))
     if len(rim_ids) < int(min_loop_edges):
         return None
-    return rim_ids, dict(diagnostics or {})
+    if require_reduction and len(raw_ids) >= int(min_loop_edges) and len(rim_ids) >= len(raw_ids):
+        return None
+    return rim_ids, {
+        **dict(diagnostics or {}),
+        "v119_live_visual_rim_normalization_used": True,
+        "v119_visual_raw_edge_count": int(len(raw_ids)),
+        "v119_visual_normalized_edge_count": int(len(rim_ids)),
+        "v119_visual_selection_contract": "visual_selection_uses_region_select_neutral_rim_authority_not_broad_raw_cloud",
+    }
+
+
+def _region_select_authoritative_bore_rim(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray | None,
+    edge_arr: np.ndarray,
+    edge_faces: Mapping[EdgeKey, list[int] | tuple[int, ...]] | None,
+    start_edge_index: int,
+    min_loop_edges: int,
+) -> tuple[tuple[int, ...], dict[str, object]] | None:
+    """Delegate rim completion to Region Select as an evidence-only fallback.
+
+    This is deliberately a small bridge.  The geometric meaning transform lives
+    in ``far_mesh.core.bore.selection.region_select``.  ``selection_edges.py`` only uses
+    the returned edge IDs for live selection display/tool input; it does not
+    inherit Region Select authority and it does not classify the feature.
+    """
+
+    if start_edge_index < 0 or start_edge_index >= len(edge_arr):
+        return None
+    return _region_select_authoritative_bore_rim_from_edge_ids(
+        vertices=vertices,
+        faces=faces,
+        edge_arr=edge_arr,
+        edge_faces=edge_faces,
+        selected_edge_ids=(int(start_edge_index),),
+        min_loop_edges=int(min_loop_edges),
+        require_reduction=False,
+    )
+
+
+def _orthonormal_basis_for_annular_rail_v173k(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    axis = _unit_np(axis, np.array([0.0, 0.0, 1.0], dtype=float))
+    ref = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(axis, ref))) > 0.90:
+        ref = np.array([0.0, 1.0, 0.0], dtype=float)
+    u = _unit_np(np.cross(axis, ref), np.array([0.0, 1.0, 0.0], dtype=float))
+    v = _unit_np(np.cross(axis, u), np.array([1.0, 0.0, 0.0], dtype=float))
+    return u, v
+
+
+def _measure_annular_rail_candidate_v173k(
+    *,
+    vertices: np.ndarray,
+    edge_arr: np.ndarray,
+    edge_ids: tuple[int, ...],
+    start_edge_index: int,
+    min_loop_edges: int,
+    max_output_edges: int,
+    source: str,
+) -> tuple[bool, dict[str, object]]:
+    """Validate a proposed live selection as neutral measured annular rail evidence.
+
+    The rim resolver may propose a possible rim/rail from topology, but topology
+    alone must not become live BoreTool input.  This fast measurement stage fits
+    a plane and circle to the proposed edge vertices and rejects broad raw edge
+    clouds before the viewport displays them or BoreTool receives them.  It does
+    not classify BORE/CHAMFER/POCKET and does not authorize rebuild.
+    """
+
+    ids = tuple(sorted({int(v) for v in tuple(edge_ids or ()) if 0 <= int(v) < len(edge_arr)}))
+    # v173l: max_output_edges is a live-display safety hint, not a semantic
+    # limit on a real high-resolution rail.  Fine meshes may have hundreds of
+    # small segments around one near-perfect circular opening; those must be
+    # measured and accepted instead of forcing manual per-segment clicks.  Keep
+    # an absolute sanity cap only to avoid validating pathological whole-mesh
+    # selections.
+    max_edges = max(int(max_output_edges), int(min_loop_edges), 1)
+    absolute_measurement_cap_v173l = max(int(max_edges), 4096)
+    diag: dict[str, object] = {
+        "annular_rail_measurement_v173k": True,
+        "annular_rail_measurement_source_v173k": str(source),
+        "annular_rail_candidate_edge_count_v173k": int(len(ids)),
+        "annular_rail_min_loop_edges_v173k": int(min_loop_edges),
+        "annular_rail_max_output_edges_v173k": int(max_edges),
+        "annular_rail_semantic_role_v173k": "measured_selected_annular_rail_evidence_not_feature_identity",
+        "high_resolution_annular_rail_restore_v173l": True,
+        "annular_rail_max_output_edges_is_display_hint_v173l": True,
+        "annular_rail_absolute_measurement_cap_v173l": int(absolute_measurement_cap_v173l),
+    }
+    if len(ids) < int(min_loop_edges):
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "too_few_edges_for_annular_rail_measurement",
+        })
+        return False, diag
+    if len(ids) > absolute_measurement_cap_v173l:
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "edge_count_exceeds_absolute_annular_rail_measurement_cap_v173l",
+        })
+        return False, diag
+
+    keys = tuple(_edge_key(edge_arr[int(eid)]) for eid in ids)
+    vertex_ids = sorted({int(v) for key in keys for v in key if 0 <= int(v) < len(vertices)})
+    if len(vertex_ids) < max(4, int(min_loop_edges) // 2):
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "too_few_vertices_for_plane_circle_fit",
+            "annular_rail_vertex_count_v173k": int(len(vertex_ids)),
+        })
+        return False, diag
+
+    pts = np.asarray(vertices, dtype=float)[np.asarray(vertex_ids, dtype=np.int64), :3]
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if len(pts) < max(4, int(min_loop_edges) // 2):
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "non_finite_vertices_for_plane_circle_fit",
+        })
+        return False, diag
+
+    center0 = pts.mean(axis=0)
+    centered = pts - center0.reshape(1, 3)
+    try:
+        _u, _s, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = _unit_np(np.asarray(vh[-1], dtype=float), np.array([0.0, 0.0, 1.0], dtype=float))
+    except Exception as exc:
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "plane_fit_failed",
+            "annular_rail_error_v173k": str(exc),
+        })
+        return False, diag
+
+    u_axis, v_axis = _orthonormal_basis_for_annular_rail_v173k(axis)
+    xy = np.column_stack((centered @ u_axis, centered @ v_axis))
+    try:
+        mat = np.column_stack((xy[:, 0], xy[:, 1], np.ones(len(xy))))
+        rhs = -(xy[:, 0] * xy[:, 0] + xy[:, 1] * xy[:, 1])
+        sol, *_ = np.linalg.lstsq(mat, rhs, rcond=None)
+        cx = -0.5 * float(sol[0])
+        cy = -0.5 * float(sol[1])
+        radius_sq = max(0.0, cx * cx + cy * cy - float(sol[2]))
+        radius = float(np.sqrt(radius_sq))
+        center = center0 + cx * u_axis + cy * v_axis
+    except Exception as exc:
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "circle_fit_failed",
+            "annular_rail_error_v173k": str(exc),
+        })
+        return False, diag
+    if not np.isfinite(radius) or radius <= 1.0e-12:
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "invalid_circle_radius",
+            "annular_rail_radius_v173k": float(radius) if np.isfinite(radius) else 0.0,
+        })
+        return False, diag
+
+    rel = pts - center.reshape(1, 3)
+    axial = rel @ axis.reshape(3)
+    radial_vec = rel - np.outer(axial, axis)
+    radii = np.linalg.norm(radial_vec, axis=1)
+    radii = radii[np.isfinite(radii)]
+    if radii.size == 0:
+        diag.update({
+            "annular_rail_measurement_valid_v173k": False,
+            "annular_rail_reject_reason_v173k": "no_valid_radial_samples",
+        })
+        return False, diag
+
+    edge_lengths = [float(_edge_length(vertices, key)) for key in keys]
+    edge_lengths = [v for v in edge_lengths if np.isfinite(v) and v > 1.0e-12]
+    median_edge_length = float(np.median(np.asarray(edge_lengths, dtype=float))) if edge_lengths else 1.0
+
+    plane_rms = float(np.sqrt(np.mean(axial * axial))) if len(axial) else 999999.0
+    radius_rms = float(np.sqrt(np.mean((radii - radius) ** 2))) if len(radii) else 999999.0
+    plane_rel_rms = float(plane_rms / max(float(radius), 1.0e-9))
+    radius_rel_rms = float(radius_rms / max(float(radius), 1.0e-9))
+    radius_min = float(np.percentile(radii, 5.0 if len(radii) >= 8 else 0.0))
+    radius_max = float(np.percentile(radii, 95.0 if len(radii) >= 8 else 100.0))
+    radial_spread = float(max(0.0, radius_max - radius_min))
+    radial_spread_ratio = float(radial_spread / max(float(radius), 1.0e-9))
+
+    mid_angles: list[float] = []
+    for key in keys:
+        mid = _edge_midpoint(vertices, key)
+        mrel = mid - center
+        ma = float(np.dot(mrel, axis))
+        mr = mrel - ma * axis
+        mx = float(np.dot(mr, u_axis))
+        my = float(np.dot(mr, v_axis))
+        md = float(np.hypot(mx, my))
+        if np.isfinite(md) and md > 1.0e-12:
+            mid_angles.append(float(np.arctan2(my, mx)))
+    if mid_angles:
+        angles = np.sort(np.asarray(mid_angles, dtype=float))
+        gaps = np.diff(np.concatenate([angles, angles[:1] + 2.0 * np.pi]))
+        max_gap = float(np.max(gaps)) if len(gaps) else 2.0 * np.pi
+        angular_coverage = float(max(0.0, min(1.0, 1.0 - max_gap / (2.0 * np.pi))))
+        max_gap_degrees = float(np.degrees(max_gap))
+    else:
+        angular_coverage = 0.0
+        max_gap_degrees = 360.0
+
+    degree: dict[int, int] = {}
+    for a, b in keys:
+        degree[int(a)] = degree.get(int(a), 0) + 1
+        degree[int(b)] = degree.get(int(b), 0) + 1
+    vertex_count = int(len(degree))
+    degree_two_count = int(sum(1 for value in degree.values() if int(value) == 2))
+    branch_vertex_count = int(sum(1 for value in degree.values() if int(value) > 2))
+    degree_two_ratio = float(degree_two_count / max(vertex_count, 1))
+    closed_loop_quality = float(min(1.0, degree_two_ratio + 0.25 * angular_coverage))
+    clicked_in_candidate = bool(int(start_edge_index) in set(ids))
+    circularity = float(max(0.0, 1.0 - min(radius_rel_rms * 4.0 + plane_rel_rms * 2.0 + max(0.0, radial_spread_ratio - 0.10) * 1.25, 1.0)))
+
+    accepted = bool(
+        clicked_in_candidate
+        and len(ids) >= int(min_loop_edges)
+        and radius > max(1.15 * median_edge_length, 1.0e-9)
+        and plane_rel_rms <= 0.16
+        and (radius_rel_rms <= 0.13 or radial_spread_ratio <= 0.26)
+        and angular_coverage >= 0.33
+        and branch_vertex_count <= max(2, int(0.10 * vertex_count))
+        and degree_two_ratio >= 0.42
+        and circularity >= 0.40
+    )
+    reasons: list[str] = []
+    if not clicked_in_candidate:
+        reasons.append("candidate_does_not_contain_clicked_edge")
+    if radius <= max(1.15 * median_edge_length, 1.0e-9):
+        reasons.append("radius_too_small_for_edge_scale")
+    if plane_rel_rms > 0.16:
+        reasons.append("plane_fit_residual_too_high")
+    if radius_rel_rms > 0.13 and radial_spread_ratio > 0.26:
+        reasons.append("circle_fit_radius_scatter_too_high")
+    if angular_coverage < 0.33:
+        reasons.append("angular_coverage_too_low")
+    if branch_vertex_count > max(2, int(0.10 * vertex_count)):
+        reasons.append("branching_topology_cloud_not_single_rail")
+    if degree_two_ratio < 0.42:
+        reasons.append("edge_graph_not_loop_like")
+    if circularity < 0.40:
+        reasons.append("circle_confidence_too_low")
+
+    diag.update({
+        "annular_rail_measurement_valid_v173k": bool(accepted),
+        "annular_rail_reject_reasons_v173k": tuple(reasons),
+        "annular_rail_reject_reason_v173k": reasons[0] if reasons else "",
+        "annular_rail_vertex_count_v173k": int(vertex_count),
+        "annular_rail_degree_two_ratio_v173k": float(degree_two_ratio),
+        "annular_rail_branch_vertex_count_v173k": int(branch_vertex_count),
+        "annular_rail_closed_loop_quality_v173k": float(closed_loop_quality),
+        "annular_rail_radius_v173k": float(radius),
+        "annular_rail_diameter_v173k": float(2.0 * radius),
+        "annular_rail_radius_min_v173k": float(radius_min),
+        "annular_rail_radius_max_v173k": float(radius_max),
+        "annular_rail_radial_spread_v173k": float(radial_spread),
+        "annular_rail_radial_spread_ratio_v173k": float(radial_spread_ratio),
+        "annular_rail_plane_fit_rms_v173k": float(plane_rms),
+        "annular_rail_plane_fit_rel_rms_v173k": float(plane_rel_rms),
+        "annular_rail_circle_fit_rms_v173k": float(radius_rms),
+        "annular_rail_circle_fit_rel_rms_v173k": float(radius_rel_rms),
+        "annular_rail_angular_coverage_v173k": float(angular_coverage),
+        "annular_rail_max_gap_degrees_v173k": float(max_gap_degrees),
+        "annular_rail_circularity_v173k": float(circularity),
+        "annular_rail_median_edge_length_v173k": float(median_edge_length),
+        "annular_rail_center_v173k": tuple(float(v) for v in center),
+        "annular_rail_axis_v173k": tuple(float(v) for v in axis),
+        "annular_rail_clicked_edge_in_candidate_v173k": bool(clicked_in_candidate),
+    })
+    return bool(accepted), diag
 
 
 # ----------------------------------------------------------------------
@@ -1067,13 +1407,14 @@ def _select_bore_opening_edge_region(
     max_gap_edge_lengths: float = 3.25,
     max_selected_edges: int | None = None,
 ) -> EdgeSelectionRegion:
-    """Return one local Bore-opening rim loop from a clicked edge.
+    """Return one local opening/rim evidence set from a clicked edge.
 
     This mode deliberately does *not* enable the old broad same-plane sibling
-    sweep.  It first gets the conservative local selection, fits a local ring
-    frame, builds a small candidate graph around that frame, prunes open tails,
-    and accepts only one degree-2 loop.  If no validated loop is found it falls
-    back to the conservative result so the UI still shows what was clicked.
+    sweep.  It first gets conservative local selection evidence, keeps the
+    clicked edge as the navigation root, tries the compact rim resolver, and
+    accepts only a local loop or bounded local handoff.  If no validated loop is
+    found it falls back to the conservative result so the UI still shows what
+    was clicked.
     """
 
     vertices_arr = _as_vertices(vertices)
@@ -1090,38 +1431,11 @@ def _select_bore_opening_edge_region(
     vertex_to_edges = _vertex_to_edges(edge_arr)
     start_key = _edge_key(edge_arr[int(start_edge_index)])
 
-    # Region Select is the BoreTool authority for neutral opening/rim meaning.
-    # The viewport may provide only one clicked edge or a partial arc here; ask
-    # Region Select to normalize that raw evidence into the complete circular
-    # rim before falling back to the legacy local-chain selector.  This does not
-    # recognize a BORE or CHAMFER.  It only returns edge IDs for the user-indicated
-    # opening/rim loop.
-    region_select_result = _region_select_authoritative_bore_rim(
-        vertices=vertices_arr,
-        faces=faces_arr,
-        edge_arr=edge_arr,
-        edge_faces=edge_faces,
-        start_edge_index=int(start_edge_index),
-        min_loop_edges=12,
-    )
-    if region_select_result is not None:
-        edge_ids, rs_diag = region_select_result
-        if len(edge_ids) >= 12:
-            return EdgeSelectionRegion(
-                edge_ids=tuple(sorted(int(v) for v in edge_ids)),
-                confidence=float(min(0.97, max(0.72, 0.50 + 0.01 * min(len(edge_ids), 32)))),
-                mode="bore_opening_loop",
-                diagnostics={
-                    "strategy": "bore_rim",
-                    "bore_opening_source": "region_select_authoritative_neutral_rim",
-                    "region_select_authority": True,
-                    "selected_edge_count": int(len(edge_ids)),
-                    "validated_loop_found": bool(
-                        (rs_diag.get("normalized_edge_graph_quality", {}) or {}).get("near_closed", False)
-                    ),
-                    "region_select_diagnostics": dict(rs_diag or {}),
-                },
-            )
+    # Do NOT ask Region Select/global rim normalization before the clicked-edge
+    # resolver.  Region Select operates on neutral evidence after selection;
+    # using it here would let an already-contaminated coarse edge cloud become
+    # practical selection authority.  Live Bore selection must first root
+    # navigation at the exact clicked edge.
 
     # Conservative first pass: gives us the clicked local feature/open path.
     safe = select_edge_region(
@@ -1141,43 +1455,132 @@ def _select_bore_opening_edge_region(
     if not safe_keys:
         safe_keys = {start_key}
 
-    # Coarse/tessellated mesh navigation path.  The conservative selector may
-    # return a broad raw edge cloud (hundreds of unrelated fragments).  Before
-    # any broad fallback is allowed to become visible selection, ask the Bore
-    # folder for a lightweight local rim resolver: clicked edge + conservative
-    # cloud -> compact rim edge IDs.  This is intentionally not RegionData, not
-    # Recognition, and not rebuild authority.
-    try:
-        from .bore.rim_resolver import resolve_bore_rim_edges_from_click_arrays
+    # v173j live-selection invariant: the conservative pass is evidence for the
+    # clicked-edge resolver, never final Bore Opening display authority when it
+    # has expanded into a broad cloud.  This prevents the old pink-cloud
+    # regression from returning through safe/no-frame/no-cycle fallbacks.
+    live_rim_cap = (
+        int(max_selected_edges)
+        if max_selected_edges is not None and int(max_selected_edges) > 0
+        else 96
+    )
+    safe_is_broad_cloud = bool(len(safe.edge_ids) > live_rim_cap)
 
-        resolved_rim = resolve_bore_rim_edges_from_click_arrays(
+    def _validated_annular_rail(edge_ids: tuple[int, ...], source: str, min_edges: int = 8) -> tuple[bool, dict[str, object]]:
+        return _measure_annular_rail_candidate_v173k(
+            vertices=vertices_arr,
+            edge_arr=edge_arr,
+            edge_ids=tuple(int(v) for v in tuple(edge_ids or ())),
+            start_edge_index=int(start_edge_index),
+            min_loop_edges=int(min_edges),
+            max_output_edges=int(live_rim_cap),
+            source=str(source),
+        )
+
+    def _compact_bore_rim_fallback(reason: str, extra: dict[str, object] | None = None) -> EdgeSelectionRegion:
+        """Return a compact clicked-edge-rooted fallback, never the raw cloud."""
+        # First try Region Select's neutral rim normalizer from the clicked edge
+        # only.  Do not feed it the broad safe cloud.  This preserves the clicked
+        # primitive as selection authority while still allowing a complete visual
+        # rim when the local resolver could not form one.
+        rs = _region_select_authoritative_bore_rim(
             vertices=vertices_arr,
             faces=faces_arr,
-            edge_index_to_vertices=edge_arr,
-            edge_to_faces=edge_faces,
-            selected_edge_ids=tuple(int(v) for v in safe.edge_ids),
+            edge_arr=edge_arr,
+            edge_faces=edge_faces,
             start_edge_index=int(start_edge_index),
             min_loop_edges=8,
-            max_output_edges=(int(max_selected_edges) if max_selected_edges is not None and int(max_selected_edges) > 0 else 96),
         )
-    except Exception:
-        resolved_rim = None
-    if resolved_rim is not None and len(tuple(resolved_rim.edge_ids or ())) >= 8:
+        if rs is not None:
+            rim_ids, rs_diag = rs
+            rim_ids = tuple(sorted({int(v) for v in rim_ids if 0 <= int(v) < len(edge_arr)}))
+            if 8 <= len(rim_ids) <= live_rim_cap:
+                measured_ok, measure_diag = _validated_annular_rail(rim_ids, "v173j_region_select_clicked_edge_rim_fallback", min_edges=8)
+                if measured_ok:
+                    return EdgeSelectionRegion(
+                        edge_ids=rim_ids,
+                        confidence=0.62,
+                        mode="bore_opening_clicked_edge_region_select_measured_annular_rail_fallback",
+                        diagnostics={
+                            **dict(rs_diag or {}),
+                            **dict(measure_diag),
+                            **dict(extra or {}),
+                            "strategy": "bore_rim",
+                            "bore_opening_source": "v173k_clicked_edge_region_select_measured_annular_rail_fallback",
+                            "clicked_edge_authority": True,
+                            "region_select_authority": "clicked_edge_only_neutral_rim_fallback_after_annular_measurement",
+                            "raw_safe_cloud_suppressed_v173j": bool(safe_is_broad_cloud),
+                            "safe_selected_edge_count": int(len(safe.edge_ids)),
+                            "selected_edge_count": int(len(rim_ids)),
+                            "fallback_reason": str(reason),
+                            "pink_cloud_regression_guard_v173j": True,
+                            "annular_rail_measurement_gate_v173k": True,
+                        },
+                    )
         return EdgeSelectionRegion(
-            edge_ids=tuple(sorted(int(v) for v in resolved_rim.edge_ids)),
-            confidence=float(resolved_rim.confidence),
-            mode="bore_opening_loop",
+            edge_ids=(int(start_edge_index),),
+            confidence=0.35,
+            mode="bore_opening_clicked_edge_only_unresolved",
             diagnostics={
+                **dict(extra or {}),
                 "strategy": "bore_rim",
-                "bore_opening_source": str(resolved_rim.source),
-                "bore_local_rim_resolver_used": True,
-                "validated_loop_found": False,
-                "topological_cycle_required": False,
-                "selected_edge_count": int(len(resolved_rim.edge_ids)),
+                "bore_opening_source": "v173j_clicked_edge_only_no_broad_cloud_fallback",
+                "clicked_edge_authority": True,
+                "region_select_authority": False,
+                "raw_safe_cloud_suppressed_v173j": bool(safe_is_broad_cloud),
                 "safe_selected_edge_count": int(len(safe.edge_ids)),
-                "resolver_diagnostics": dict(resolved_rim.diagnostics or {}),
+                "selected_edge_count": 1,
+                "fallback_reason": str(reason),
+                "validated_loop_found": False,
+                "pink_cloud_regression_guard_v173j": True,
             },
         )
+
+    # The active auto-rim selection authority is the clicked-edge resolver.  It
+    # sees the conservative cloud as evidence, but start_edge_index remains the
+    # navigation root: clicked edge -> local rim evidence, not broad cloud ->
+    # best global circle.
+    resolver_result = _rim_resolver_bore_rim_from_safe_selection(
+        vertices=vertices_arr,
+        faces=faces_arr,
+        edge_arr=edge_arr,
+        edge_faces=edge_faces,
+        selected_edge_ids=tuple(int(v) for v in safe.edge_ids),
+        start_edge_index=int(start_edge_index),
+        min_loop_edges=8,
+        max_output_edges=(
+            max(int(max_selected_edges), 768)
+            if max_selected_edges is not None and int(max_selected_edges) > 0
+            else 768
+        ),
+    )
+    resolver_reject_diag: dict[str, object] = {}
+    if resolver_result is not None and len(resolver_result.edge_ids) >= 8:
+        resolver_edge_ids = tuple(sorted(int(v) for v in resolver_result.edge_ids))
+        measured_ok, measure_diag = _validated_annular_rail(resolver_edge_ids, "clicked_edge_rim_resolver_output", min_edges=8)
+        if measured_ok:
+            return EdgeSelectionRegion(
+                edge_ids=resolver_edge_ids,
+                confidence=float(min(0.96, max(float(resolver_result.confidence), 0.70))),
+                mode="bore_opening_clicked_edge_measured_annular_rail",
+                diagnostics={
+                    **dict(resolver_result.diagnostics or {}),
+                    **dict(measure_diag),
+                    "strategy": "bore_rim",
+                    "bore_opening_source": "v173k_clicked_edge_rim_resolver_measured_annular_rail",
+                    "region_select_authority": False,
+                    "clicked_edge_authority": True,
+                    "start_edge_index": int(start_edge_index),
+                    "safe_selected_edge_count": int(len(safe.edge_ids)),
+                    "selected_edge_count": int(len(resolver_edge_ids)),
+                    "validated_loop_found": True,
+                    "annular_rail_measurement_gate_v173k": True,
+                },
+            )
+        resolver_reject_diag = {
+            "rim_resolver_output_rejected_by_annular_measurement_v173k": True,
+            **dict(measure_diag),
+        }
 
     # If the conservative pass already produced one real loop, keep it.
     safe_cycles = _bore_degree_two_cycles(safe_keys, min_loop_edges=12)
@@ -1192,19 +1595,23 @@ def _select_bore_opening_edge_region(
         if best:
             cycle_keys, score = best
             edge_ids = tuple(sorted(int(key_to_index[k]) for k in cycle_keys if k in key_to_index))
-            return EdgeSelectionRegion(
-                edge_ids=edge_ids,
-                confidence=float(min(0.96, 0.72 + 0.02 * min(len(edge_ids), 10))),
-                mode="bore_opening_loop",
-                diagnostics={
-                    "strategy": "bore_rim",
-                    "bore_opening_source": "safe_degree_two_loop",
-                    "selected_edge_count": len(edge_ids),
-                    "candidate_loop_count": len(safe_cycles),
-                    "score": float(score),
-                    "safe_selected_edge_count": len(safe.edge_ids),
-                },
-            )
+            measured_ok, measure_diag = _validated_annular_rail(edge_ids, "safe_degree_two_loop", min_edges=8)
+            if measured_ok:
+                return EdgeSelectionRegion(
+                    edge_ids=edge_ids,
+                    confidence=float(min(0.96, 0.72 + 0.02 * min(len(edge_ids), 10))),
+                    mode="bore_opening_measured_annular_rail_loop",
+                    diagnostics={
+                        **dict(measure_diag),
+                        "strategy": "bore_rim",
+                        "bore_opening_source": "v173k_safe_degree_two_measured_annular_rail",
+                        "selected_edge_count": len(edge_ids),
+                        "candidate_loop_count": len(safe_cycles),
+                        "score": float(score),
+                        "safe_selected_edge_count": len(safe.edge_ids),
+                        "annular_rail_measurement_gate_v173k": True,
+                    },
+                )
 
     frame = _fit_bore_opening_frame(
         vertices=vertices_arr,
@@ -1217,17 +1624,12 @@ def _select_bore_opening_edge_region(
     )
 
     if frame is None or not np.isfinite(frame.radius) or frame.radius <= 1.0e-12:
-        return EdgeSelectionRegion(
-            edge_ids=(int(start_edge_index),),
-            confidence=min(float(safe.confidence), 0.42),
-            mode="bore_opening_unvalidated",
-            diagnostics={
+        return _compact_bore_rim_fallback(
+            "safe_fallback_no_frame",
+            {
                 **safe.diagnostics,
-                "strategy": "bore_rim",
-                "bore_opening_source": "single_edge_guard_no_frame",
                 "validated_loop_found": False,
                 "safe_selected_edge_count": len(safe.edge_ids),
-                "broad_safe_fallback_suppressed": True,
             },
         )
 
@@ -1242,20 +1644,24 @@ def _select_bore_opening_edge_region(
         seed_keys=safe_keys,
     )
 
-    if max_selected_edges is not None and int(max_selected_edges) > 0 and len(candidate_keys) > int(max_selected_edges):
-        # Candidate graph is too large to be a single local opening.  Fall back.
-        return EdgeSelectionRegion(
-            edge_ids=(int(start_edge_index),),
-            confidence=min(float(safe.confidence), 0.40),
-            mode="bore_opening_unvalidated",
-            diagnostics={
+    high_resolution_candidate_cap_v173l = (
+        max(int(max_selected_edges), 768)
+        if max_selected_edges is not None and int(max_selected_edges) > 0
+        else 768
+    )
+    if len(candidate_keys) > int(high_resolution_candidate_cap_v173l):
+        # Candidate graph is too large for live selection.  This is a topology-cloud
+        # safety cap, not the old 96-edge semantic cap.  High-resolution real
+        # rings up to the cap are still measured as annular rail evidence.
+        return _compact_bore_rim_fallback(
+            "safe_fallback_candidate_cap",
+            {
                 **safe.diagnostics,
-                "strategy": "bore_rim",
-                "bore_opening_source": "single_edge_guard_candidate_cap",
                 "validated_loop_found": False,
                 "candidate_edge_count": len(candidate_keys),
-                "max_selected_edges": int(max_selected_edges),
-                "broad_safe_fallback_suppressed": True,
+                "max_selected_edges": int(max_selected_edges) if max_selected_edges is not None else None,
+                "high_resolution_candidate_cap_v173l": int(high_resolution_candidate_cap_v173l),
+                "high_resolution_annular_rail_restore_v173l": True,
             },
         )
 
@@ -1287,26 +1693,30 @@ def _select_bore_opening_edge_region(
     if best:
         cycle_keys, score = best
         edge_ids = tuple(sorted(int(key_to_index[k]) for k in cycle_keys if k in key_to_index))
-        return EdgeSelectionRegion(
-            edge_ids=edge_ids,
-            confidence=float(min(0.94, max(0.68, score))),
-            mode="bore_opening_loop",
-            diagnostics={
-                "strategy": "bore_rim",
-                "bore_opening_source": "local_frame_cycle",
-                "bore_opening_cycle_source": cycle_source,
-                "expensive_anchor_cycle_search_enabled": False,
-                "validated_loop_found": True,
-                "selected_edge_count": len(edge_ids),
-                "candidate_edge_count": len(candidate_keys),
-                "candidate_loop_count": len(cycles),
-                "safe_selected_edge_count": len(safe.edge_ids),
-                "ring_frame_available": True,
-                "frame_radius": float(frame.radius),
-                "frame_sample_count": int(frame.sample_count),
-                "score": float(score),
-            },
-        )
+        measured_ok, measure_diag = _validated_annular_rail(edge_ids, "local_frame_cycle", min_edges=8)
+        if measured_ok:
+            return EdgeSelectionRegion(
+                edge_ids=edge_ids,
+                confidence=float(min(0.94, max(0.68, score))),
+                mode="bore_opening_measured_annular_rail_loop",
+                diagnostics={
+                    **dict(measure_diag),
+                    "strategy": "bore_rim",
+                    "bore_opening_source": "v173k_local_frame_measured_annular_rail_cycle",
+                    "bore_opening_cycle_source": cycle_source,
+                    "expensive_anchor_cycle_search_enabled": False,
+                    "validated_loop_found": True,
+                    "selected_edge_count": len(edge_ids),
+                    "candidate_edge_count": len(candidate_keys),
+                    "candidate_loop_count": len(cycles),
+                    "safe_selected_edge_count": len(safe.edge_ids),
+                    "ring_frame_available": True,
+                    "frame_radius": float(frame.radius),
+                    "frame_sample_count": int(frame.sample_count),
+                    "score": float(score),
+                    "annular_rail_measurement_gate_v173k": True,
+                },
+            )
 
     # Damaged/messy meshes may not contain one topological cycle, but they can
     # still contain enough local rim evidence for core.bore.measure to fit the
@@ -1318,22 +1728,26 @@ def _select_bore_opening_edge_region(
         frame=frame,
         start_key=start_key,
         min_edges=12,
-        max_edges=(int(max_selected_edges) if max_selected_edges is not None and int(max_selected_edges) > 0 else 192),
+        max_edges=(max(int(max_selected_edges), 768) if max_selected_edges is not None and int(max_selected_edges) > 0 else 768),
     )
     if len(handoff_keys) >= 12:
         edge_ids = tuple(sorted(int(key_to_index[k]) for k in handoff_keys if k in key_to_index))
-        compact_handoff = bool(len(edge_ids) <= 96 and len(edge_ids) <= max(24, int(0.45 * max(len(safe.edge_ids), 1))))
-        if compact_handoff:
+        measured_ok, measure_diag = _validated_annular_rail(edge_ids, "bounded_local_candidate_handoff", min_edges=8)
+        if measured_ok:
+            # Do not pass this handoff cloud back through Region Select for visual
+            # normalization.  If the clicked-edge resolver did not accept it, global
+            # normalization is exactly the path that can jump to unrelated coarse
+            # mesh features.
             return EdgeSelectionRegion(
                 edge_ids=edge_ids,
-                confidence=0.50,
-                mode="bore_opening_measurement_handoff",
+                confidence=0.56,
+                mode="bore_opening_measured_annular_rail_handoff",
                 diagnostics={
+                    **dict(measure_diag),
                     "strategy": "bore_rim",
-                    "bore_opening_source": "compact_bounded_local_candidate_handoff",
-                    "validated_loop_found": False,
+                    "bore_opening_source": "v173k_bounded_local_measured_annular_rail_handoff",
+                    "validated_loop_found": True,
                     "measurement_handoff": True,
-                    "visual_selection_compact_guard_passed": True,
                     "expensive_anchor_cycle_search_enabled": False,
                     "selected_edge_count": len(edge_ids),
                     "candidate_edge_count": len(candidate_keys),
@@ -1342,26 +1756,24 @@ def _select_bore_opening_edge_region(
                     "ring_frame_available": True,
                     "frame_radius": float(frame.radius),
                     "frame_sample_count": int(frame.sample_count),
+                    "annular_rail_measurement_gate_v173k": True,
                 },
             )
 
-    return EdgeSelectionRegion(
-        edge_ids=(int(start_edge_index),),
-        confidence=min(float(safe.confidence), 0.40),
-        mode="bore_opening_unvalidated",
-        diagnostics={
+    return _compact_bore_rim_fallback(
+        "safe_fallback_no_valid_cycle",
+        {
             **safe.diagnostics,
-            "strategy": "bore_rim",
-            "bore_opening_source": "single_edge_guard_no_valid_cycle",
+            **resolver_reject_diag,
             "validated_loop_found": False,
             "measurement_handoff": False,
             "expensive_anchor_cycle_search_enabled": False,
             "candidate_edge_count": len(candidate_keys),
             "candidate_loop_count": len(cycles),
             "safe_selected_edge_count": len(safe.edge_ids),
-            "broad_safe_fallback_suppressed": True,
             "ring_frame_available": True,
             "frame_radius": float(frame.radius),
+            "annular_rail_measurement_gate_v173k": True,
         },
     )
 

@@ -1,4 +1,10 @@
-# far_mesh/viewer/pyvista_viewport.py
+"""PyVista viewport implementation.
+
+The viewport is a picking and display backend.  It preserves clicked primitive
+metadata and forwards generic selection strategies, but it does not classify
+features, assign ownership, or authorize rebuild.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -276,6 +282,7 @@ class PyVistaViewport(QWidget):
             "selected_edge_ids": list(self._selected_edge_ids),
             "edge_region_strategy": self._edge_region_strategy,
             "last_picked_world_pos": self._last_picked_world_pos,
+            "edge_pick_seed": dict(self._last_edge_pick_seed or {}),
             "brush_select_enabled": self._brush_selection_enabled,
             "diagnostic_mode": self._diagnostic_mode,
             "host_info_visible": self._show_host_info,
@@ -1800,6 +1807,12 @@ class PyVistaViewport(QWidget):
         return adjacency
 
     def set_edge_region_strategy(self, strategy: str | None) -> None:
+        """Set the generic core edge-region strategy for edge picking.
+
+        This is selection intent only.  The viewport forwards the strategy to
+        ``core.selection_edges`` and does not interpret it as feature identity.
+        """
+
         value = str(strategy or "safe").strip().lower()
         if value not in {"safe", "open_component", "feature", "ring", "aggressive", "single", "bore_rim"}:
             value = "safe"
@@ -1885,6 +1898,40 @@ class PyVistaViewport(QWidget):
             fallback_face_index=face_index,
         )
 
+    def _edge_pick_seed_payload(self, edge_index: int) -> dict[str, Any]:
+        """Preserve the primitive clicked before edge-region expansion.
+
+        The payload is raw pick evidence for tools such as BoreTool.  It is not
+        feature identity and not rebuild authority.
+        """
+
+        payload: dict[str, Any] = {
+            "metadata_contract": "viewport_click_seed_primitive_v143",
+            "backend": self.BACKEND_NAME,
+            "selection_origin": "edge_pick_before_region_expansion",
+            "seed_edge_id": int(edge_index),
+            "clicked_edge_id": int(edge_index),
+            "edge_region_strategy": str(self._edge_region_strategy),
+        }
+        try:
+            if self._edge_index_to_vertices is not None and 0 <= int(edge_index) < len(self._edge_index_to_vertices):
+                a, b = self._edge_index_to_vertices[int(edge_index)]
+                edge_vertices = (int(a), int(b))
+                payload["seed_edge_vertex_ids"] = edge_vertices
+                key = tuple(sorted(edge_vertices))
+                faces = ()
+                try:
+                    if isinstance(self._edge_to_faces, dict):
+                        faces = tuple(int(v) for v in self._edge_to_faces.get(key, ()))
+                except Exception:
+                    faces = ()
+                payload["seed_adjacent_face_ids"] = faces
+        except Exception:
+            pass
+        if self._last_picked_world_pos is not None:
+            payload["seed_pick_point"] = tuple(float(v) for v in self._last_picked_world_pos)
+        return payload
+
     def _get_connected_edge_region(self, edge_index: int) -> set[int]:
         if self._current_vertices is None or self._edge_index_to_vertices is None:
             return {int(edge_index)}
@@ -1908,11 +1955,13 @@ class PyVistaViewport(QWidget):
             return
         if edge_index < 0 or edge_index >= len(self._edge_index_to_vertices):
             return
+        self._last_edge_pick_seed = self._edge_pick_seed_payload(int(edge_index))
         strategy = self.get_edge_region_strategy()
         if strategy in {"bore_rim", "ring", "aggressive", "open_component", "feature"}:
             selected = self._get_connected_edge_region(int(edge_index))
         else:
             selected = {int(edge_index)}
+        self._last_edge_pick_seed["expanded_edge_count"] = int(len(selected))
         self.highlight_edges(sorted(selected))
         self.status_changed.emit(f"Selected {len(self._selected_edge_ids)} edge(s).")
 

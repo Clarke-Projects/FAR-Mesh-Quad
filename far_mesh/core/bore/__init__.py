@@ -1,19 +1,14 @@
 """Public Bore core API.
 
-Hard-clean Bore recognition package.
-
 Active architecture:
-    region_select.py -> RegionData only
-    recognition.py -> RegionData-to-CandidateData bridge
-    recognition_component_engine.py -> physical CandidateData classifier
-    rebuild_target.py -> DeletePatchProposal policy
-    rebuild.py -> RebuildResult / topology validation
+    selection/region_select.py -> RegionData only
+    recognition/recognition.py -> RegionData-to-CandidateData bridge
+    recognition/recognition_component_engine.py -> physical CandidateData classifier and surface-role owner
+    rebuild/rebuild_target.py -> DeletePatchProposal policy
+    rebuild/rebuild.py -> RebuildResult / semantic remesh / topology validation
 
-Removed:
-    removed pre-component candidate pipeline
-    parent-minus-chamfer fallback
-    guarded all-RegionData borehole fallback
-    post-hoc recognition repair helpers
+This package exports the current mesh-native BoreTool contracts while keeping
+removed prototype pipelines out of the active import path.
 """
 
 from __future__ import annotations
@@ -31,6 +26,11 @@ from .types import (
     FeaturePrimitiveData,
     FeatureRelationshipKind,
     FeatureRelationshipData,
+    MeshRealizationKind,
+    OpeningProfileKind,
+    MeshRealizationAssessment,
+    OpeningFootprintAuthority,
+    OpeningEvidenceLedgerData,
     FeatureEvidenceItem,
     FeatureEvidenceLedger,
     X1_FREECAD_TO_FAR_MESH_DICTIONARY,
@@ -44,15 +44,17 @@ from .exceptions import (
     BoreTargetInvalid,
     BoreTopologyError,
 )
-from .rebuild_target import (
+from .rebuild.rebuild_target import (
+    RebuildTargetPatch,
     build_bounded_rebuild_target_face_sets,
     build_rebuild_target_contract_for_feature,
     candidate_can_request_delete_patch,
     prepare_rebuild_target,
     target_from_candidate_dict,
+    target_patches_from_result,
 )
-from .rebuild import RebuildResult, delete_and_rebuild_candidate_region
-from .region_select import (
+from .rebuild.rebuild import RebuildResult, delete_and_rebuild_candidate_region
+from .selection.region_select import (
     BoreRegionSelection,
     region_faces,
     faces_inside_boundary,
@@ -70,13 +72,13 @@ from .geometry import (
     measure_faces_against_cylinder,
     measure_feature_patch_geometry,
 )
-from .recognition import (
+from .recognition.recognition import (
     ACTIVE_CANDIDATE_AUTHORITY,
     ASSEMBLY_CLASSIFICATION_POLICY,
     REGION_SELECT_FEATURE_AUTHORITY,
     recognize_bore_region_selection,
 )
-from .recognition_component_engine import (
+from .recognition.recognition_component_engine import (
     component_engine_feature_candidates,
     recognition_result_dict_from_component_features,
 )
@@ -90,6 +92,7 @@ from .measure import (
     measure_two_opening_bore_frame,
     measure_bore_region,
 )
+from .selection.mesh_realization import build_opening_evidence_ledger_from_arrays
 from .heuristics import (
     HEURISTIC_CONTRACT_VERSION,
     HEURISTIC_AUTHORITY,
@@ -134,6 +137,11 @@ __all__ = [
     "FeaturePrimitiveData",
     "FeatureRelationshipKind",
     "FeatureRelationshipData",
+    "MeshRealizationKind",
+    "OpeningProfileKind",
+    "MeshRealizationAssessment",
+    "OpeningFootprintAuthority",
+    "OpeningEvidenceLedgerData",
     "FeatureEvidenceItem",
     "FeatureEvidenceLedger",
     "X1_FREECAD_TO_FAR_MESH_DICTIONARY",
@@ -188,6 +196,8 @@ __all__ = [
     "build_bounded_rebuild_target_face_sets",
     "build_rebuild_target_contract_for_feature",
     "prepare_rebuild_target",
+    "target_patches_from_result",
+    "RebuildTargetPatch",
     "target_from_candidate_dict",
     "BoreCandidateView",
     "BoreInsideBoundaryPreview",
@@ -197,5 +207,6 @@ __all__ = [
     "preview_faces_inside_boundary",
     "rebuild_bore_candidate",
     "format_bore_diagnostics",
+    "build_opening_evidence_ledger_from_arrays",
     "RebuildResult",
 ]

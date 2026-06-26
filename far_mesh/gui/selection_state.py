@@ -1,8 +1,16 @@
+"""Host-owned selection state and seed-evidence storage.
+
+This module stores normalized viewport selection IDs and the last raw clicked
+primitive metadata.  It does not interpret those IDs as feature identity.  For
+BoreTool, ``edge_pick_seed`` preserves the exact clicked edge before the
+selection stack expands it into rim/opening evidence.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -173,10 +181,11 @@ class SelectionSession:
 
 @dataclass(slots=True, frozen=True)
 class SelectionState:
-    """
-    Actual current selection state.
+    """Actual current selection state.
 
-    This is the controller's normalized mirror of the viewport selection state.
+    This is the controller's normalized mirror of viewport selection state.
+    The IDs remain selection evidence only; feature tools decide later whether
+    the evidence means a rim, face role, CandidateData, or rebuild target.
     """
     mode: SelectionMode = SelectionMode.NONE
     selected_vertex_ids: tuple[int, ...] = ()
@@ -187,6 +196,7 @@ class SelectionState:
     interaction_style: InteractionStyle = InteractionStyle.VIEWER
     boundary_highlight: bool = False
     last_pick_point: tuple[float, float, float] | None = None
+    edge_pick_seed: Mapping[str, Any] = field(default_factory=dict)
     revision: int = 0
 
     @property
@@ -350,6 +360,34 @@ class SelectionState:
             revision=self.revision + int(revision_delta),
         )
 
+    def with_edge_pick_seed(
+        self,
+        seed: Mapping[str, Any] | None,
+        *,
+        revision_delta: int = 1,
+    ) -> SelectionState:
+        """Attach the last raw viewport edge-pick seed metadata.
+
+        This metadata is evidence-routing context only.  It preserves the
+        primitive the operator actually clicked before any tool-specific edge
+        expansion has turned that click into a larger selected edge region.
+        """
+
+        safe_seed: dict[str, Any] = {}
+        if isinstance(seed, Mapping):
+            for key, value in seed.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    safe_seed[str(key)] = value
+                elif isinstance(value, (tuple, list)):
+                    safe_seed[str(key)] = tuple(value)
+                elif isinstance(value, Mapping):
+                    safe_seed[str(key)] = dict(value)
+        return replace(
+            self,
+            edge_pick_seed=safe_seed,
+            revision=self.revision + int(revision_delta),
+        )
+
     def cleared(
         self,
         *,
@@ -364,6 +402,7 @@ class SelectionState:
             selected_edge_ids=(),
             selected_mesh_ids=(),
             last_pick_point=None,
+            edge_pick_seed={},
             revision=self.revision + int(revision_delta),
         )
 
@@ -408,6 +447,10 @@ class SelectionSnapshot:
     @property
     def interaction_style(self) -> InteractionStyle:
         return self.state.interaction_style
+
+    @property
+    def edge_pick_seed(self) -> Mapping[str, Any]:
+        return dict(self.state.edge_pick_seed or {})
 
     @property
     def boundary_highlight(self) -> bool:

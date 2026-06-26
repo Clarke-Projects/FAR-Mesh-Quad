@@ -4,13 +4,18 @@ This module is the single BoreTool logic boundary used by the GUI. It keeps
 ``bore_actions.py`` display-only and prevents a second GUI controller file from
 being created.
 
-Clean flow
-----------
-    selected edge IDs -> RegionData -> CandidateData -> display DTOs -> bore_actions.py display
+Clean analysis flow
+-------------------
+    selected edge IDs -> RegionData -> Recognition/CandidateData -> display DTOs -> bore_actions.py display
+
+Clean rebuild flow
+------------------
+    selected CandidateView -> explicit rebuild_face_ids -> rebuild.py -> RebuildResult -> host commit
 
 ``bore_actions.py`` receives only ready-to-display DTOs and face IDs for
-preview. All interpretation of raw recognition dictionaries and all Bore action
-flow live here inside the core BoreTool boundary.
+preview. All interpretation of raw recognition dictionaries, candidate
+rebuild-authority checks, rebuild metadata routing, and Bore action flow live
+here inside the core BoreTool boundary.
 """
 
 from __future__ import annotations
@@ -21,9 +26,9 @@ from typing import Iterable, Mapping, Any
 import math
 import os
 
-from .region_select import faces_inside_boundary, select_region_data
-from .recognition import recognize_bore_region_selection
-from .rebuild import delete_and_rebuild_candidate_region
+from .selection.region_select import faces_inside_boundary, select_region_data
+from .recognition.recognition import recognize_bore_region_selection
+from .rebuild.rebuild import delete_and_rebuild_candidate_region
 from .types import tuple_ints
 
 RGBA = tuple[int, int, int, int]
@@ -45,6 +50,26 @@ def _feature_operation_name(candidate: object | None) -> str:
     if entity == "borehole" or family == "bore":
         return "BORE"
     return "BoreTool"
+
+
+def _canonical_candidate_family_label(candidate: object | None) -> str:
+    """Return the semantic operation family for logs.
+
+    CandidateData is the operation authority here; rebuild diagnostics may still
+    include legacy BoreTool gate names.  The log should therefore prefer the
+    selected candidate's explicit entity/family when reporting the canonical
+    semantic family.
+    """
+
+    family = str(getattr(candidate, "feature_family", "") or "").strip().lower()
+    entity = str(getattr(candidate, "entity_type", "") or "").strip().lower()
+    if entity in {"pocket", "circular_pocket"} or family in {"pocket", "circular_pocket"}:
+        return "pocket"
+    if entity == "chamfer" or family == "chamfer_form":
+        return "chamfer"
+    if entity in {"bore", "borehole"} or family == "bore":
+        return "bore"
+    return family or entity or "unknown"
 
 
 
@@ -146,7 +171,12 @@ class BoreInsideBoundaryPreview:
 # -----------------------------------------------------------------------------
 
 
-def analyze_bore_candidates(mesh: object, edge_ids: Iterable[int]) -> BoreToolDisplayResult:
+def analyze_bore_candidates(
+    mesh: object,
+    edge_ids: Iterable[int],
+    *,
+    selection_metadata: Mapping[str, object] | None = None,
+) -> BoreToolDisplayResult:
     """Run the BoreTool analysis pipeline and return display-ready data.
 
     This is the only analysis function the GUI controller needs for candidate
@@ -163,7 +193,7 @@ def analyze_bore_candidates(mesh: object, edge_ids: Iterable[int]) -> BoreToolDi
     # entity.  It must produce a displayable selected volume even if Recognition
     # later fails.  This is the first visual contract of the BoreTool:
     # "what local mesh volume did the picked rim/opening select?"
-    region = select_region_data(mesh, selected_edge_ids)
+    region = select_region_data(mesh, selected_edge_ids, selection_metadata=selection_metadata)
     region_diag = dict(getattr(region, "diagnostics", {}) or {})
 
     region_face_ids = tuple_ints(getattr(region, "face_ids", ()))
@@ -534,6 +564,52 @@ def _first_face_ids(raw: Mapping[str, object], keys: tuple[str, ...]) -> tuple[i
     return ()
 
 
+def _numeric_present(raw: Mapping[str, object], key: str) -> bool:
+    try:
+        return key in raw and math.isfinite(float(raw.get(key)))
+    except Exception:
+        return False
+
+
+def _numeric_value(raw: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    try:
+        value = float(raw.get(key, default))
+    except Exception:
+        return float(default)
+    return float(value) if math.isfinite(value) else float(default)
+
+
+def _range_suffix(raw: Mapping[str, object], *, min_key: str, max_key: str, nominal_key: str) -> str:
+    if not (_numeric_present(raw, min_key) and _numeric_present(raw, max_key)):
+        return ""
+    lo = _numeric_value(raw, min_key)
+    hi = _numeric_value(raw, max_key)
+    nominal = _numeric_value(raw, nominal_key, (lo + hi) * 0.5)
+    # Always show the range when the unified envelope fields are available.
+    # Dense circular rims will naturally print a tight range; coarse polygonal
+    # rims will print a wider envelope.
+    return f" [{_short_number(lo)}..{_short_number(hi)}]"
+
+
+def _radial_envelope_summary(raw: Mapping[str, object]) -> str:
+    parts: list[str] = []
+    if _numeric_present(raw, "diameter_min") and _numeric_present(raw, "diameter_max"):
+        parts.append(
+            "diameter_range=%s..%s"
+            % (_short_number(raw.get("diameter_min")), _short_number(raw.get("diameter_max")))
+        )
+    if _numeric_present(raw, "radius_min") and _numeric_present(raw, "radius_max"):
+        parts.append(
+            "radius_range=%s..%s"
+            % (_short_number(raw.get("radius_min")), _short_number(raw.get("radius_max")))
+        )
+    if _numeric_present(raw, "radial_spread_ratio"):
+        parts.append("spread_ratio=%s" % _short_number(raw.get("radial_spread_ratio")))
+    if "coarse_polygonal" in raw:
+        parts.append("coarse_polygonal=%s" % bool(raw.get("coarse_polygonal")))
+    return " | ".join(parts)
+
+
 def _geometry_text(raw: Mapping[str, object], *, entity_type: str) -> str:
     if entity_type == "chamfer":
         return "R %s → %s  H %s" % (
@@ -542,15 +618,19 @@ def _geometry_text(raw: Mapping[str, object], *, entity_type: str) -> str:
             _short_number(raw.get("height", raw.get("axial_span", 0.0))),
         )
     if entity_type == "borehole":
-        return "Ø %s  R %s  D %s" % (
-            _short_number(raw.get("diameter", 0.0)),
-            _short_number(raw.get("radius", 0.0)),
+        return "Ø %s%s  R %s%s  D %s" % (
+            _short_number(raw.get("diameter_nominal", raw.get("diameter", 0.0))),
+            _range_suffix(raw, min_key="diameter_min", max_key="diameter_max", nominal_key="diameter_nominal"),
+            _short_number(raw.get("radius_nominal", raw.get("radius", 0.0))),
+            _range_suffix(raw, min_key="radius_min", max_key="radius_max", nominal_key="radius_nominal"),
             _short_number(raw.get("depth", raw.get("height", raw.get("axial_span", 0.0)))),
         )
     if entity_type == "pocket":
-        return "Ø %s  R %s  D %s  floor %s wall %s" % (
-            _short_number(raw.get("diameter", 2.0 * float(raw.get("radius", raw.get("primitive_radius", 0.0)) or 0.0))),
-            _short_number(raw.get("radius", raw.get("primitive_radius", 0.0))),
+        return "Ø %s%s  R %s%s  D %s  floor %s wall %s" % (
+            _short_number(raw.get("diameter_nominal", raw.get("diameter", 2.0 * float(raw.get("radius", raw.get("primitive_radius", 0.0)) or 0.0)))),
+            _range_suffix(raw, min_key="diameter_min", max_key="diameter_max", nominal_key="diameter_nominal"),
+            _short_number(raw.get("radius_nominal", raw.get("radius", raw.get("primitive_radius", 0.0)))),
+            _range_suffix(raw, min_key="radius_min", max_key="radius_max", nominal_key="radius_nominal"),
             _short_number(raw.get("depth", raw.get("height", raw.get("axial_span", 0.0)))),
             int(raw.get("pocket_floor_face_count", len(tuple_ints(raw.get("pocket_floor_face_ids", ()))) or 0) or 0),
             int(raw.get("pocket_side_wall_face_count", len(tuple_ints(raw.get("pocket_side_wall_face_ids", ()))) or 0) or 0),
@@ -610,14 +690,16 @@ def _candidate_description(raw: Mapping[str, object], *, display_face_ids: tuple
     if primitive_rows:
         lines.append(f"feature_primitives: {len(primitive_rows)}")
         for idx, primitive in enumerate(primitive_rows[:3], start=1):
+            envelope = _radial_envelope_summary(primitive)
             lines.append(
-                "feature_primitive_%d: kind=%s radius=%s depth=%s role=%s"
+                "feature_primitive_%d: kind=%s radius=%s depth=%s role=%s%s"
                 % (
                     idx,
                     primitive.get("primitive_kind", "unknown"),
-                    _short_number(primitive.get("radius", 0.0)),
+                    _short_number(primitive.get("radius", primitive.get("radius_nominal", 0.0))),
                     _short_number(primitive.get("depth", 0.0)),
                     primitive.get("role", "-"),
+                    (" | " + envelope) if envelope else "",
                 )
             )
     relationship_rows = _feature_relationship_rows(raw)
@@ -640,7 +722,12 @@ def _candidate_description(raw: Mapping[str, object], *, display_face_ids: tuple
         "rebuild_target_policy_allowed", "rebuild_target_policy_reason", "delete_patch_request_allowed",
         "heuristic_contract_version", "heuristic_recipe_name", "heuristic_authority_policy",
         "status", "promotion_state", "role", "candidate_action_enabled", "candidate_action", "rebuild_disabled_reason",
-        "surface_condition", "repair_strategy", "confidence", "radius", "diameter", "depth", "height", "axial_span",
+        "surface_condition", "repair_strategy", "confidence",
+        "radius", "radius_min", "radius_nominal", "radius_max",
+        "diameter", "diameter_min", "diameter_nominal", "diameter_max",
+        "radial_spread", "radial_spread_ratio", "coarse_polygonal",
+        "primitive_radius_min", "primitive_radius_max", "primitive_radial_spread_ratio",
+        "depth", "height", "axial_span",
         # POCKET preview-only recognition fields.
         "pocket_kind", "pocket_floor_face_count", "pocket_side_wall_face_count", "pocket_transition_face_count",
         "pocket_depth", "pocket_footprint_radius", "pocket_side_wall_coverage", "pocket_rebuild_enable_scope",
@@ -650,6 +737,9 @@ def _candidate_description(raw: Mapping[str, object], *, display_face_ids: tuple
         "normal_axis_abs_median", "radial_normal_alignment_median", "touches_selected_opening", "touches_opposite_opening",
         "touches_both_openings", "min_distance_to_selected_opening", "min_distance_to_opposite_opening",
         "opening_touch_tolerance", "selected_opening_primary_edge_count", "selected_opening_support_weak",
+        "selected_opening_edge_count_is_small_v156", "small_clean_opening_is_trustworthy_v156",
+        "small_clean_component_geometry_strong_v156", "selected_opening_primary_component_weak_overridden_v156",
+        "small_clean_bore_ownership_promoted_v156", "small_clean_bore_promotion_reason_v156",
         "two_opening_axis_direction_preserved", "two_opening_axis_dot_opening_to_opposite", "bore_axis_source",
         "sidewall_normal_evidence_count", "frame_sidewall_normal_evidence_count", "broad_sidewall_normal_evidence_count",
         "bore_wall_interior_margin", "bore_wall_broad_radial_min", "bore_wall_broad_radial_max",
@@ -665,6 +755,18 @@ def _candidate_description(raw: Mapping[str, object], *, display_face_ids: tuple
         "true_endpoint_reconciled_from_region_endpoint", "endpoint_support_face_count",
         "terminal_wall_candidate_face_count", "terminal_wall_face_count", "terminal_wall_completion_used",
         "terminal_wall_completion_rejection_reasons", "true_endpoint_extension_added_face_count",
+        "v154_terminal_continuation_coaxial_audit_used",
+        "terminal_continuation_face_count", "terminal_continuation_candidate_face_count",
+        "terminal_continuation_connected_to_core_wall", "terminal_continuation_component_count",
+        "terminal_continuation_touch_core_face_count",
+        "terminal_continuation_axial_min", "terminal_continuation_axial_max", "terminal_continuation_axial_span",
+        "terminal_continuation_radius_min", "terminal_continuation_radius_median", "terminal_continuation_radius_max",
+        "terminal_continuation_radius_error_median", "terminal_continuation_radius_error_max",
+        "terminal_continuation_radial_mad", "terminal_continuation_radial_mad_rel",
+        "terminal_continuation_radial_align_median", "terminal_continuation_normal_axis_abs_median",
+        "terminal_continuation_centerline_distance_median", "terminal_continuation_centerline_distance_max",
+        "terminal_continuation_axis_dot_to_selected_opening",
+        "terminal_continuation_passed_coaxial_audit", "terminal_continuation_coaxial_audit_reason",
         "candidate_face_policy", "bore_frame_depth_source",
         "two_opening_search_boundary_face_count", "bore_wall_search_face_count", "bore_wall_candidate_component_count",
     ):
@@ -700,6 +802,25 @@ def _routed_outputs_text(
     engine = diagnostics.get("component_engine_diagnostics")
     if not isinstance(engine, Mapping):
         engine = {}
+    # v155 diagnostic plumbing: candidate-level diagnostics may contain the
+    # accepted BORE terminal-continuation audit before it is promoted into the
+    # top-level component_engine_diagnostics dict.  Merge missing keys into the
+    # routed display view so diagnostics do not show "-" while CandidateData
+    # already carries the values.  Top-level engine values remain authoritative.
+    primary_candidate_diag: Mapping[str, object] = {}
+    for _cand in tuple(candidates or ()):
+        try:
+            _token = dict(_cand.rebuild_token or {})
+        except Exception:
+            _token = {}
+        _diag = _token.get("diagnostics")
+        if isinstance(_diag, Mapping):
+            primary_candidate_diag = _diag
+            break
+    if primary_candidate_diag:
+        _merged_engine = dict(primary_candidate_diag)
+        _merged_engine.update(dict(engine))
+        engine = _merged_engine
     feature_patch = diagnostics.get("feature_patch_measurement")
     if not isinstance(feature_patch, Mapping):
         feature_patch = {}
@@ -718,6 +839,85 @@ def _routed_outputs_text(
         f"  volumetric_anchor_policy: {diagnostics.get('volumetric_anchor_policy', '-')}",
         f"  primary_anchor_edge_count: {diagnostics.get('primary_anchor_edge_count', '-')}",
     ]
+    opening_ledger = diagnostics.get("opening_evidence_ledger") or diagnostics.get("mesh_realization_evidence_ledger")
+    if isinstance(opening_ledger, Mapping):
+        lines.append("opening mesh-realization evidence:")
+        authority = opening_ledger.get("selected_authority", {})
+        assessment = opening_ledger.get("mesh_realization_assessment", {})
+        if isinstance(assessment, Mapping):
+            for key in (
+                "realization_kind",
+                "topology_quality",
+                "edge_fragmentation",
+                "closed_loop_quality",
+                "polygonality",
+                "pollution_score",
+                "angular_support_quality",
+            ):
+                if key in assessment:
+                    lines.append(f"  {key}: {assessment[key]}")
+        if isinstance(authority, Mapping):
+            for key in (
+                "profile_kind",
+                "confidence",
+                "support_edge_count",
+                "estimated_segment_count",
+                "angular_coverage",
+                "max_angular_gap_degrees",
+                "radius_min",
+                "radius_nominal",
+                "radius_max",
+                "diameter_min",
+                "diameter_nominal",
+                "diameter_max",
+                "radial_spread_ratio",
+                "observed_min_max_ratio",
+                "expected_polygon_min_max_ratio",
+                "polygon_model_agreement",
+                "contamination_flags",
+            ):
+                if key in authority:
+                    lines.append(f"  authority_{key}: {authority[key]}")
+
+    opening_probe = diagnostics.get("opening_probe_ledger") or diagnostics.get("x1_style_opening_probe_ledger")
+    if isinstance(opening_probe, Mapping):
+        lines.append("1a. X1-style opening probe ledger:")
+        probe_input = opening_probe.get("input", {})
+        probe_counts = opening_probe.get("probe_counts", {})
+        relationships = opening_probe.get("relationships", {})
+        if not isinstance(probe_input, Mapping):
+            probe_input = {}
+        if not isinstance(probe_counts, Mapping):
+            probe_counts = {}
+        if not isinstance(relationships, Mapping):
+            relationships = {}
+        probe_diag = opening_probe.get("diagnostics", {})
+        role_filter = {}
+        corridor = {}
+        if isinstance(probe_diag, Mapping):
+            corridor = probe_diag.get("corridor", {})
+            role_filter = probe_diag.get("role_island_filter", {})
+        if not isinstance(corridor, Mapping):
+            corridor = {}
+        if not isinstance(role_filter, Mapping):
+            role_filter = {}
+        lines.extend([
+            f"  authority: {opening_probe.get('authority', '-')}",
+            f"  confidence: {opening_probe.get('confidence', '-')}",
+            f"  raw/normalized edges: {probe_input.get('raw_selected_edge_count', '-')} / {probe_input.get('normalized_edge_count', '-')}",
+            f"  broad/local probe faces: {probe_counts.get('broad_region_face_count', probe_input.get('region_face_count', '-'))} / {probe_counts.get('local_probe_face_count', probe_counts.get('sample_face_count', '-'))}",
+            f"  sample/sidewall/floor faces: {probe_counts.get('sample_face_count', '-')} / {probe_counts.get('sidewall_like_face_count', '-')} / {probe_counts.get('floor_like_face_count', '-')}",
+            f"  probe islands: {corridor.get('component_count', '-')} | selected={corridor.get('selected_component_index', '-')} | rejected_faces={corridor.get('rejected_component_face_count', '-')}",
+            f"  selected island score/seed hits: {corridor.get('selected_component_score', '-')} / {corridor.get('selected_component_seed_hit_count', '-')}",
+            f"  role islands: {role_filter.get('role_component_count', '-')} | selected={role_filter.get('selected_role_component_index', '-')} | rejected_role_faces={role_filter.get('rejected_role_face_count', '-')}",
+            f"  role filter before/after: {role_filter.get('role_filter_before_count', '-')} / {role_filter.get('role_filter_after_count', '-')}",
+            f"  axial layers: {probe_counts.get('axial_layer_count', '-')}",
+            f"  sidewall span: {relationships.get('sidewall_depth_span', relationships.get('sidewall_axial_span', '-'))}",
+            f"  resolved depth: {relationships.get('resolved_depth', '-')}",
+            f"  relation hint: {relationships.get('relation_hint', '-')}",
+            f"  contradictions: {opening_probe.get('contradictions', ())}",
+        ])
+
     opening_audit = diagnostics.get("selected_opening_measurement_audit")
     if isinstance(opening_audit, Mapping):
         lines.extend([
@@ -729,7 +929,12 @@ def _routed_outputs_text(
             f"  raw candidates: {opening_audit.get('raw_candidate_count', '-')}",
             f"  normalized candidates: {opening_audit.get('normalized_candidate_count', '-')}",
             f"  raw best radius/conf: {opening_audit.get('raw_best_radius', '-')} / {opening_audit.get('raw_best_confidence', '-')}",
+            f"  raw best radius range: {opening_audit.get('raw_best_radius_min', '-')} .. {opening_audit.get('raw_best_radius_max', '-')} | diameter range: {opening_audit.get('raw_best_diameter_min', '-')} .. {opening_audit.get('raw_best_diameter_max', '-')}",
+            f"  raw best spread/coarse: {opening_audit.get('raw_best_radial_spread_ratio', '-')} / {opening_audit.get('raw_best_coarse_polygonal', '-')}",
             f"  normalized best radius/conf: {opening_audit.get('normalized_best_radius', '-')} / {opening_audit.get('normalized_best_confidence', '-')}",
+            f"  normalized best radius range: {opening_audit.get('normalized_best_radius_min', '-')} .. {opening_audit.get('normalized_best_radius_max', '-')} | diameter range: {opening_audit.get('normalized_best_diameter_min', '-')} .. {opening_audit.get('normalized_best_diameter_max', '-')}",
+            f"  normalized best spread/coarse: {opening_audit.get('normalized_best_radial_spread_ratio', '-')} / {opening_audit.get('normalized_best_coarse_polygonal', '-')}",
+            f"  raw component best radius range: {opening_audit.get('raw_component_best_radius_min', '-')} .. {opening_audit.get('raw_component_best_radius_max', '-')} | diameter range: {opening_audit.get('raw_component_best_diameter_min', '-')} .. {opening_audit.get('raw_component_best_diameter_max', '-')}",
             f"  raw-vs-normalized agree: {opening_audit.get('raw_vs_normalized_measurement_agree', '-')}",
             f"  collapse suspected: {opening_audit.get('normalized_rim_collapse_suspected', '-')}",
         ])
@@ -740,13 +945,29 @@ def _routed_outputs_text(
                 f"  resolver_status: {resolver.get('resolver_status', '-')}",
                 f"  resolved: {resolver.get('resolved', '-')}",
                 f"  source: {resolver.get('resolver_source', '-')}",
+                f"  authority policy: {resolver.get('selected_opening_authority_policy', '-')}",
+                f"  raw override: {resolver.get('normalized_candidates_forbidden_by_raw_authority_override', '-')}",
                 f"  radius/conf: {resolver.get('radius', '-')} / {resolver.get('confidence', '-')}",
+                f"  radius range: {resolver.get('radius_min', '-')} .. {resolver.get('radius_max', '-')} | diameter range: {resolver.get('diameter_min', '-')} .. {resolver.get('diameter_max', '-')}",
+                f"  spread/coarse: {resolver.get('radial_spread_ratio', '-')} / {resolver.get('coarse_polygonal', '-')}",
                 f"  edge_count: {resolver.get('edge_count', '-')}",
                 f"  score: {resolver.get('score', resolver.get('best_score', '-'))}",
                 f"  axis_dot_to_region: {resolver.get('axis_abs_dot_to_region', resolver.get('best_axis_abs_dot_to_region', '-'))}",
                 f"  radius_delta_rel_to_region: {resolver.get('radius_delta_rel_to_region', resolver.get('best_radius_delta_rel_to_region', '-'))}",
                 f"  centerline_distance_to_region: {resolver.get('centerline_distance_to_region', resolver.get('best_centerline_distance_to_region', '-'))}",
             ])
+            raw_override_diag = resolver.get("raw_opening_authority_override")
+            if isinstance(raw_override_diag, Mapping):
+                lines.append(
+                    "  raw override detail: "
+                    f"reason={raw_override_diag.get('reason', '-')} | "
+                    f"raw_spread={raw_override_diag.get('raw_best_spread_ratio', '-')} / "
+                    f"raw_comp_spread={raw_override_diag.get('raw_component_best_spread_ratio', '-')} / "
+                    f"norm_spread={raw_override_diag.get('normalized_best_spread_ratio', '-')} | "
+                    f"raw_conf={raw_override_diag.get('raw_best_confidence', '-')} / "
+                    f"raw_comp_conf={raw_override_diag.get('raw_component_best_confidence', '-')} / "
+                    f"norm_conf={raw_override_diag.get('normalized_best_confidence', '-')}"
+                )
         two_frame = opening_audit.get("two_opening_bore_frame")
         if isinstance(two_frame, Mapping):
             two_diag = two_frame.get("diagnostics", {})
@@ -757,6 +978,8 @@ def _routed_outputs_text(
                 f"  valid: {two_frame.get('valid', '-')}",
                 f"  status: {two_frame.get('status', '-')}",
                 f"  radius: {two_frame.get('radius', '-')}",
+                f"  radius range: {two_frame.get('radius_min', '-')} .. {two_frame.get('radius_max', '-')} | diameter range: {two_frame.get('diameter_min', '-')} .. {two_frame.get('diameter_max', '-')}",
+                f"  spread/coarse: {two_frame.get('radial_spread_ratio', '-')} / {two_frame.get('coarse_polygonal', '-')}",
                 f"  depth: {two_frame.get('depth', '-')}",
                 f"  opposite_opening_found: {two_diag.get('opposite_opening_found', '-')}",
                 f"  opposite_candidate_count: {two_diag.get('opposite_candidate_count', '-')}",
@@ -765,6 +988,8 @@ def _routed_outputs_text(
         "2. Recognition / CandidateData output:",
         f"  measured patch faces: {feature_patch.get('face_count', '-')}",
         f"  measured radius: {feature_patch.get('radius', '-')}",
+        f"  measured radius range: {feature_patch.get('radius_min', '-')} .. {feature_patch.get('radius_max', '-')} | diameter range: {feature_patch.get('diameter_min', '-')} .. {feature_patch.get('diameter_max', '-')}",
+        f"  measured spread/coarse: {feature_patch.get('radial_spread_ratio', '-')} / {feature_patch.get('coarse_polygonal', '-')}",
         f"  axial/depth span: {feature_patch.get('axial_span', feature_patch.get('depth_estimate', '-'))}",
         f"  rebuild_ready: {diagnostics.get('rebuild_ready', '-')}",
         f"  recognition_failed: {diagnostics.get('recognition_failed', False)}",
@@ -799,6 +1024,7 @@ def _routed_outputs_text(
         f"  face_span_axial_ownership_used: {engine.get('face_span_axial_ownership_used', '-')}",
         f"  aggregate_wall_angular_coverage: {engine.get('aggregate_wall_angular_coverage', '-')}",
         f"  aggregate_wall_rejection_reasons: {engine.get('aggregate_wall_rejection_reasons', '-')}",
+        f"  v156 small clean bore gate: small_edges={engine.get('selected_opening_edge_count_is_small_v156', '-')} clean={engine.get('small_clean_opening_is_trustworthy_v156', '-')} override={engine.get('selected_opening_primary_component_weak_overridden_v156', '-')} promoted={engine.get('small_clean_bore_ownership_promoted_v156', '-')} reason={engine.get('small_clean_bore_promotion_reason_v156', '-')}",
         f"  measured/owned frame depth: {engine.get('measured_two_opening_frame_depth', '-')} / {engine.get('owned_bore_frame_depth', '-')}",
         f"  owned frame depth delta: {engine.get('owned_bore_frame_depth_delta', '-')}",
         f"  owned_frame_reconciled_from_wall_ownership: {engine.get('owned_frame_reconciled_from_wall_ownership', '-')}",
@@ -810,6 +1036,24 @@ def _routed_outputs_text(
         f"  endpoint_support_face_count: {engine.get('endpoint_support_face_count', '-')}",
         f"  terminal_wall_candidate/owned/added: {engine.get('terminal_wall_candidate_face_count', '-')} / {engine.get('terminal_wall_face_count', '-')} / {engine.get('true_endpoint_extension_added_face_count', '-')}",
         f"  terminal_wall_completion_used: {engine.get('terminal_wall_completion_used', '-')}",
+        f"  terminal continuation coaxial audit: used={engine.get('v154_terminal_continuation_coaxial_audit_used', '-')} passed={engine.get('terminal_continuation_passed_coaxial_audit', '-')} reason={engine.get('terminal_continuation_coaxial_audit_reason', '-')}",
+        f"  terminal continuation connectivity/components: connected={engine.get('terminal_continuation_connected_to_core_wall', '-')} components={engine.get('terminal_continuation_component_count', '-')} touch_core_faces={engine.get('terminal_continuation_touch_core_face_count', '-')}",
+        f"  terminal continuation axial min/max/span: {engine.get('terminal_continuation_axial_min', '-')} / {engine.get('terminal_continuation_axial_max', '-')} / {engine.get('terminal_continuation_axial_span', '-')}",
+        f"  terminal continuation radius min/median/max: {engine.get('terminal_continuation_radius_min', '-')} / {engine.get('terminal_continuation_radius_median', '-')} / {engine.get('terminal_continuation_radius_max', '-')}",
+        f"  terminal continuation radius error median/max: {engine.get('terminal_continuation_radius_error_median', '-')} / {engine.get('terminal_continuation_radius_error_max', '-')}",
+        f"  terminal continuation radial MAD rel / radial align / normal axis: {engine.get('terminal_continuation_radial_mad_rel', '-')} / {engine.get('terminal_continuation_radial_align_median', '-')} / {engine.get('terminal_continuation_normal_axis_abs_median', '-')}",
+        f"  terminal continuation centerline median/max and axis_dot: {engine.get('terminal_continuation_centerline_distance_median', '-')} / {engine.get('terminal_continuation_centerline_distance_max', '-')} / {engine.get('terminal_continuation_axis_dot_to_selected_opening', '-')}",
+        f"  terminal continuation angular coverage/gap/samples: {engine.get('terminal_continuation_angular_coverage', '-')} / {engine.get('terminal_continuation_max_angular_gap_degrees', '-')} / {engine.get('terminal_continuation_circumferential_sample_count', '-')}",
+        f"  terminal continuation selected-radius gate: R={engine.get('terminal_continuation_selected_radius_authority', '-')} tol={engine.get('terminal_continuation_radius_gate_tolerance', '-')} outside={engine.get('terminal_continuation_outside_radius_gate_count', '-')} ratio={engine.get('terminal_continuation_outside_radius_gate_ratio', '-')} max_err={engine.get('terminal_continuation_outside_radius_gate_max_error', '-')}",
+        f"  terminal continuation boundary audit v155: {engine.get('terminal_continuation_boundary_audit_reason_v155', '-')}",
+        f"  v157 semantic target proof: safe={engine.get('bore_rebuild_semantic_target_safe_v157', '-')} reasons={engine.get('bore_rebuild_semantic_rejection_reasons_v157', '-')}",
+        f"  v157 owned boundary loops/edges: loops={engine.get('bore_wall_owned_boundary_loop_count_v157', '-')} edges={engine.get('bore_wall_owned_boundary_edge_count_v157', '-')} vertices={engine.get('bore_wall_owned_boundary_loop_vertex_counts_v157', '-')}",
+        f"  v157 boundary role: expected_two_loop={engine.get('bore_wall_expected_two_opening_patch_v157', '-')} damaged_internal={engine.get('bore_wall_damaged_internal_boundary_evidence_v157', '-')} owned_valid={engine.get('owned_patch_boundary_role_valid_v157', '-')} terminal_valid={engine.get('terminal_completion_role_valid_v157', '-')}",
+        f"  v158 semantic owned-face mapping: used={engine.get('v158_semantic_owned_face_mapping_used', '-')} source={engine.get('v158_semantic_owned_face_mapping_source', '-')} removed={engine.get('v158_semantic_owned_face_removed_count', '-')}",
+        f"  v158 owned subset report: {engine.get('v158_semantic_owned_subset_report', '-')}",
+        f"  v159 repaired BORE subset reauth: used={engine.get('v159_repaired_bore_subset_reauthorized', '-')} removed_terminal={engine.get('v159_terminal_continuation_removed_from_rebuild_target', '-')} terminal_after={engine.get('v159_terminal_face_count_after_repair', '-')} reason={engine.get('v159_repaired_bore_subset_reauthorization_reason', '-')}",
+        f"  v158 pocket child-boundary split: used={engine.get('v158_pocket_child_boundary_filter_used', '-')} safe={engine.get('pocket_child_bore_boundary_rebuild_safe_v158', '-')} removed={engine.get('v158_pocket_child_bore_intrusion_face_count', '-')} sidewall={engine.get('v158_pocket_side_wall_face_count_before_child_filter', '-')}->{engine.get('v158_pocket_side_wall_face_count_after_child_filter', '-')} reason={engine.get('v158_pocket_child_boundary_filter_reason', '-')}",
+        f"  v159 pocket rebuild reauth: safe={engine.get('pocket_child_bore_boundary_rebuild_safe_v159', '-')} reauthorized={engine.get('v159_pocket_reauthorized_after_cleaned_child_boundary_split', '-')} reason={engine.get('v159_pocket_reauthorization_reason', '-')}",
         f"  candidate_face_policy: {engine.get('candidate_face_policy', '-')}",
         f"  bore_frame_depth_source: {engine.get('bore_frame_depth_source', '-')}",
         f"  two_opening_search_boundary_face_count: {engine.get('two_opening_search_boundary_face_count', '-')}",
@@ -907,9 +1151,10 @@ def _routed_outputs_text(
             if not isinstance(report, Mapping):
                 continue
             lines.append(
-                "  [%d] faces=%s span=%s coverage=%s strict=%s radial_mad=%s normal_axis=%s radial_align=%s touchA=%s touchB=%s reason=%s"
+                "  [%d] kind=%s faces=%s span=%s coverage=%s strict=%s radial_mad=%s normal_axis=%s radial_align=%s touchA=%s touchB=%s v156_strong=%s v156_override=%s v158_semantic=%s reason=%s"
                 % (
                     ridx,
+                    report.get("wall_report_kind", "-"),
                     report.get("face_count", "-"),
                     report.get("axial_span", "-"),
                     report.get("wall_span_fraction_of_two_opening_depth", "-"),
@@ -919,6 +1164,9 @@ def _routed_outputs_text(
                     report.get("radial_normal_alignment_median", "-"),
                     report.get("touches_selected_opening", "-"),
                     report.get("touches_opposite_opening", "-"),
+                    report.get("small_clean_component_geometry_strong_v156", "-"),
+                    report.get("selected_opening_primary_component_weak_overridden_v156", "-"),
+                    report.get("v158_semantic_owned_subset_candidate", report.get("semantic_role_v158", "-")),
                     report.get("rejection_reasons", report.get("reject_reason", "-")),
                 )
             )
@@ -1221,7 +1469,7 @@ def _analysis_text(
 ) -> str:
     return (
         f"Raw viewport edge selection: {len(selected_edge_ids)}\n"
-        f"Normalized Bore ring evidence: {len(normalized_edge_ids)}\n"
+        f"Selected annular rail evidence: {len(normalized_edge_ids)}\n"
         f"Selected RegionData faces: {len(region_face_ids)}\n"
         f"Seed faces: {len(seed_face_ids)}\n"
         f"Axis hint: {axis}\n"
@@ -1262,6 +1510,70 @@ def format_bore_diagnostics(diagnostics: Mapping[str, object] | object) -> str:
             if key in feature_patch:
                 lines.append(f"  {key}: {feature_patch[key]}")
 
+    opening_ledger = diagnostics.get("opening_evidence_ledger") or diagnostics.get("mesh_realization_evidence_ledger")
+    if isinstance(opening_ledger, Mapping):
+        lines.append("opening mesh-realization evidence:")
+        authority = opening_ledger.get("selected_authority", {})
+        assessment = opening_ledger.get("mesh_realization_assessment", {})
+        if isinstance(assessment, Mapping):
+            for key in (
+                "realization_kind",
+                "topology_quality",
+                "edge_fragmentation",
+                "closed_loop_quality",
+                "polygonality",
+                "pollution_score",
+                "angular_support_quality",
+            ):
+                if key in assessment:
+                    lines.append(f"  {key}: {assessment[key]}")
+        if isinstance(authority, Mapping):
+            for key in (
+                "profile_kind",
+                "confidence",
+                "support_edge_count",
+                "estimated_segment_count",
+                "angular_coverage",
+                "max_angular_gap_degrees",
+                "radius_min",
+                "radius_nominal",
+                "radius_max",
+                "diameter_min",
+                "diameter_nominal",
+                "diameter_max",
+                "radial_spread_ratio",
+                "observed_min_max_ratio",
+                "expected_polygon_min_max_ratio",
+                "polygon_model_agreement",
+                "contamination_flags",
+            ):
+                if key in authority:
+                    lines.append(f"  authority_{key}: {authority[key]}")
+
+    opening_probe = diagnostics.get("opening_probe_ledger") or diagnostics.get("x1_style_opening_probe_ledger")
+    if isinstance(opening_probe, Mapping):
+        lines.append("x1-style opening probe ledger:")
+        probe_input = opening_probe.get("input", {})
+        probe_counts = opening_probe.get("probe_counts", {})
+        relationships = opening_probe.get("relationships", {})
+        if not isinstance(probe_input, Mapping):
+            probe_input = {}
+        if not isinstance(probe_counts, Mapping):
+            probe_counts = {}
+        if not isinstance(relationships, Mapping):
+            relationships = {}
+        lines.append(f"  authority: {opening_probe.get('authority', '-')}")
+        lines.append(f"  confidence: {opening_probe.get('confidence', '-')}")
+        lines.append(f"  raw_selected_edge_count: {probe_input.get('raw_selected_edge_count', '-')}")
+        lines.append(f"  normalized_edge_count: {probe_input.get('normalized_edge_count', '-')}")
+        lines.append(f"  sample_face_count: {probe_counts.get('sample_face_count', '-')}")
+        lines.append(f"  sidewall_like_face_count: {probe_counts.get('sidewall_like_face_count', '-')}")
+        lines.append(f"  floor_like_face_count: {probe_counts.get('floor_like_face_count', '-')}")
+        lines.append(f"  axial_layer_count: {probe_counts.get('axial_layer_count', '-')}")
+        lines.append(f"  sidewall_axial_span: {relationships.get('sidewall_axial_span', '-')}")
+        lines.append(f"  relation_hint: {relationships.get('relation_hint', '-')}")
+        lines.append(f"  contradictions: {opening_probe.get('contradictions', ())}")
+
     opening_audit = diagnostics.get("selected_opening_measurement_audit")
     if isinstance(opening_audit, Mapping):
         lines.append("selected opening measurement audit:")
@@ -1274,8 +1586,26 @@ def format_bore_diagnostics(diagnostics: Mapping[str, object] | object) -> str:
             "normalized_candidate_count",
             "raw_component_candidate_count",
             "raw_best_radius",
+            "raw_best_radius_min",
+            "raw_best_radius_max",
+            "raw_best_diameter_min",
+            "raw_best_diameter_max",
+            "raw_best_radial_spread_ratio",
+            "raw_best_coarse_polygonal",
             "normalized_best_radius",
+            "normalized_best_radius_min",
+            "normalized_best_radius_max",
+            "normalized_best_diameter_min",
+            "normalized_best_diameter_max",
+            "normalized_best_radial_spread_ratio",
+            "normalized_best_coarse_polygonal",
             "raw_component_best_radius",
+            "raw_component_best_radius_min",
+            "raw_component_best_radius_max",
+            "raw_component_best_diameter_min",
+            "raw_component_best_diameter_max",
+            "raw_component_best_radial_spread_ratio",
+            "raw_component_best_coarse_polygonal",
             "raw_best_confidence",
             "normalized_best_confidence",
             "raw_component_best_confidence",
@@ -1302,6 +1632,16 @@ def format_bore_diagnostics(diagnostics: Mapping[str, object] | object) -> str:
                 "resolved",
                 "resolver_source",
                 "radius",
+                "radius_min",
+                "radius_nominal",
+                "radius_max",
+                "diameter",
+                "diameter_min",
+                "diameter_nominal",
+                "diameter_max",
+                "radial_spread",
+                "radial_spread_ratio",
+                "coarse_polygonal",
                 "confidence",
                 "edge_count",
                 "primary_edge_count",
@@ -1321,7 +1661,13 @@ def format_bore_diagnostics(diagnostics: Mapping[str, object] | object) -> str:
         two_frame = opening_audit.get("two_opening_bore_frame")
         if isinstance(two_frame, Mapping):
             lines.append("two-opening BORE frame measurement:")
-            for key in ("valid", "status", "semantic_stage", "radius", "diameter", "depth", "confidence", "opening_center", "opposite_center", "axis"):
+            for key in (
+                "valid", "status", "semantic_stage",
+                "radius", "radius_min", "radius_nominal", "radius_max",
+                "diameter", "diameter_min", "diameter_nominal", "diameter_max",
+                "radial_spread", "radial_spread_ratio", "coarse_polygonal",
+                "depth", "confidence", "opening_center", "opposite_center", "axis",
+            ):
                 if key in two_frame:
                     lines.append(f"  {key}: {two_frame[key]}")
             two_diag = two_frame.get("diagnostics", {})
@@ -1551,6 +1897,7 @@ class BoreToolRuntime:
         self.selected_candidate_id: str = ""
         self.previewed_candidate_id: str = ""
         self.cached_edge_ids: tuple[int, ...] = ()
+        self.cached_selection_metadata: dict[str, object] = {}
         self._source_mesh_signature: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------
@@ -1676,6 +2023,31 @@ class BoreToolRuntime:
                 controller.sync_from_viewport(reason="boretool_request")
             except Exception:
                 pass
+
+    def _selection_seed_metadata(self) -> dict[str, object]:
+        """Return raw clicked-edge seed metadata from the host selection bridge."""
+
+        controller = getattr(self.owner, "selection_controller", None)
+        if controller is not None:
+            getter = getattr(controller, "edge_pick_seed_snapshot", None)
+            if callable(getter):
+                try:
+                    payload = getter(reason="boretool_edge_pick_seed_metadata")
+                    if isinstance(payload, Mapping):
+                        return dict(payload)
+                except Exception:
+                    pass
+        viewport = getattr(self.owner, "viewport", None)
+        if viewport is not None and hasattr(viewport, "get_selection_state"):
+            try:
+                state = viewport.get_selection_state()
+                if isinstance(state, Mapping):
+                    payload = state.get("edge_pick_seed", state.get("last_edge_pick_seed", {}))
+                    if isinstance(payload, Mapping):
+                        return dict(payload)
+            except Exception:
+                pass
+        return dict(self.cached_selection_metadata or {})
 
     def _selected_edge_ids(self) -> tuple[int, ...]:
         controller = getattr(self.owner, "selection_controller", None)
@@ -2029,6 +2401,7 @@ class BoreToolRuntime:
 
         if existing_edge_ids:
             self.cached_edge_ids = tuple(existing_edge_ids)
+            self.cached_selection_metadata = self._selection_seed_metadata()
             self._log(
                 f"BoreTool received {len(existing_edge_ids)} selected edge ID(s) from Edge Selection; "
                 "routing into Region Select."
@@ -2108,6 +2481,7 @@ class BoreToolRuntime:
         self.selected_candidate_id = ""
         self.previewed_candidate_id = ""
         self.cached_edge_ids = ()
+        self.cached_selection_metadata = {}
         self._source_mesh_signature = None
         fn = getattr(self.owner, "_bore_display_clear_all", None)
         if callable(fn):
@@ -2157,12 +2531,22 @@ class BoreToolRuntime:
         processor = self._processor()
         mesh = self._mesh()
         use_planned = self._use_execution_layer_for_bore()
+        selection_metadata = self._selection_seed_metadata()
+        self.cached_selection_metadata = dict(selection_metadata or {})
 
         def task() -> BoreToolDisplayResult:
             planned = getattr(processor, "analyze_bore_candidates_planned", None) if processor is not None else None
             if use_planned and callable(planned):
-                return planned(edge_ids)
-            return analyze_bore_candidates(mesh, edge_ids)
+                try:
+                    return planned(edge_ids, selection_metadata=selection_metadata)
+                except TypeError:
+                    # Older Phase-task adapters only accepted edge_ids.  Do not
+                    # silently drop v143 true-click seed metadata: fall back to
+                    # the in-process BoreTool path when metadata is present.
+                    if selection_metadata:
+                        return analyze_bore_candidates(mesh, edge_ids, selection_metadata=selection_metadata)
+                    return planned(edge_ids)
+            return analyze_bore_candidates(mesh, edge_ids, selection_metadata=selection_metadata)
 
         def on_success(result: object) -> None:
             if not isinstance(result, BoreToolDisplayResult):
@@ -2200,7 +2584,7 @@ class BoreToolRuntime:
         execution_note = " via Phase 6 task" if self._use_execution_layer_for_bore() else ""
         self._log(
             f"BoreTool listed {len(result.candidates)} candidate(s) from {len(result.region_face_ids)} RegionData faces; "
-            f"normalized ring edges {len(result.normalized_edge_ids)}{execution_note}."
+            f"selected annular rail evidence {len(result.normalized_edge_ids)}{execution_note}."
         )
         self._status(
             f"Selected neutral volume: {len(result.region_preview_face_ids)} faces; "
@@ -2347,6 +2731,21 @@ class BoreToolRuntime:
         def on_failure(error: object) -> str:
             feature_label = _feature_operation_name(candidate)
             message = str(error or f"{feature_label} rebuild failed.")
+            if "Traceback (most recent call last):" in message:
+                # v146 safety net: expected rebuild-target rejections should be
+                # user-visible messages, not multi-line worker tracebacks.  Keep
+                # programming errors visible unless this is one of the known
+                # topology/no-mutation rebuild rejection paths.
+                lines = [line.strip() for line in message.splitlines() if line.strip()]
+                last = lines[-1] if lines else message
+                if (
+                    "Geometry changed: no" in message
+                    or "Unequal-loop quad plan rejected by topology rule" in message
+                    or "POCKET rebuild target rejected before mesh mutation" in message
+                ):
+                    if last.startswith("ValueError:"):
+                        last = last.split("ValueError:", 1)[1].strip()
+                    message = last
             self._log(f"{feature_label} rebuild failed: {message}")
             fn = getattr(self.owner, "_bore_display_error", None)
             if callable(fn):
@@ -2390,8 +2789,40 @@ class BoreToolRuntime:
         except Exception:
             added_face_ids = ()
         added_count = int(getattr(result, "added_face_count", len(added_face_ids)))
+        added_runtime_triangle_count = int(added_count)
+        added_logical_quad_count = int(added_count)
+        generated_vertex_count = 0
+        semantic_geometry_used = False
+        semantic_geometry_policy = "-"
+        semantic_feature_remesh_used = False
+        semantic_feature_family = "-"
+        semantic_constraint_model = "-"
+        v163_radius_source = "-"
+        v163_candidate_radius_rejected = False
+        v164_angular_density_deferred = False
+        v164_requested_segments = 0
+        v164_locked_segments = 0
         if isinstance(diagnostics, Mapping):
-            added_count = int(diagnostics.get("added_logical_quad_count", diagnostics.get("actual_added_face_count", added_count)) or added_count)
+            added_runtime_triangle_count = int(diagnostics.get("added_runtime_triangle_count", diagnostics.get("actual_added_face_count", added_count)) or added_count)
+            added_logical_quad_count = int(diagnostics.get("added_logical_quad_count", added_runtime_triangle_count) or added_runtime_triangle_count)
+            # Keep the existing display count contract for owner callbacks, but
+            # make the log explicit below so logical quads are not confused with
+            # runtime triangles.
+            added_count = int(added_logical_quad_count)
+            generated_vertex_count = int(diagnostics.get("generated_vertex_count", diagnostics.get("semantic_geometric_generated_vertex_count_v160", 0)) or 0)
+            semantic_geometry_used = bool(diagnostics.get("semantic_geometric_rebuild_used_v160", False))
+            semantic_geometry_policy = str(diagnostics.get("semantic_geometric_rebuild_policy_v160", "-") or "-")
+            semantic_feature_remesh_used = bool(diagnostics.get("constraint_bound_feature_remesh_used", diagnostics.get("constraint_bound_feature_remesh_used_v162", semantic_geometry_used)))
+            semantic_feature_family = str(diagnostics.get("semantic_feature_family", diagnostics.get("semantic_feature_family_v162", "-")) or "-")
+            canonical_candidate_family = _canonical_candidate_family_label(candidate)
+            if canonical_candidate_family != "unknown":
+                semantic_feature_family = canonical_candidate_family
+            semantic_constraint_model = str(diagnostics.get("semantic_constraint_model", diagnostics.get("semantic_constraint_model_v162", "-")) or "-")
+            v163_radius_source = str(diagnostics.get("semantic_radius_authority_source", diagnostics.get("v163_constraint_radius_authority_source", "-")) or "-")
+            v163_candidate_radius_rejected = bool(diagnostics.get("candidate_radius_rejected_by_authority_guard", diagnostics.get("v163_candidate_radius_rejected", False)))
+            v164_angular_density_deferred = bool(diagnostics.get("locked_boundary_angular_density_guard_used", diagnostics.get("v164_boundary_locked_angular_density_deferred", False)))
+            v164_requested_segments = int(diagnostics.get("v164_requested_circumferential_segments", 0) or 0)
+            v164_locked_segments = int(diagnostics.get("v164_boundary_locked_circumferential_segments", 0) or 0)
 
         used_phase6_rebuild = False
         if isinstance(diagnostics, Mapping):
@@ -2473,10 +2904,25 @@ class BoreToolRuntime:
         self.selected_candidate_id = ""
         self.previewed_candidate_id = ""
         self.cached_edge_ids = ()
+        self.cached_selection_metadata = {}
         self._source_mesh_signature = None
         execution_note = " via Phase 6 task" if used_phase6_rebuild else ""
         feature_label = _feature_operation_name(candidate)
-        self._log(f"{feature_label} rebuild committed{execution_note}: removed {removed_count}, added {added_count}, faces {before_faces} -> {after_faces}.")
+        topo_note = (
+            f"removed {removed_count} runtime triangles, "
+            f"added {added_logical_quad_count} logical quads / {added_runtime_triangle_count} runtime triangles, "
+            f"generated_vertices={generated_vertex_count}, "
+            f"semantic_geometry_v160={semantic_geometry_used}"
+        )
+        if semantic_geometry_used:
+            topo_note += f" policy={semantic_geometry_policy}"
+        if semantic_feature_remesh_used:
+            topo_note += f" feature_remesh_v162=True family={semantic_feature_family} constraint={semantic_constraint_model}"
+        if v163_radius_source != "-":
+            topo_note += f" radius_authority_v163={v163_radius_source} candidate_radius_rejected={v163_candidate_radius_rejected}"
+        if v164_angular_density_deferred:
+            topo_note += f" angular_density_v164=deferred_locked_boundary requested={v164_requested_segments} used={v164_locked_segments}"
+        self._log(f"{feature_label} rebuild committed{execution_note}: {topo_note}, faces {before_faces} -> {after_faces}.")
         self._status(f"{feature_label} rebuild committed; stale selection cleared and Bore edge-pick re-armed.", 3000)
         self._push_action_state()
 

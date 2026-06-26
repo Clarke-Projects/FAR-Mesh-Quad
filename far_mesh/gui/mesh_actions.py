@@ -21,7 +21,8 @@ class MeshActionsMixin:
     This mixin owns GUI-side load/export/repair/remesh/reduce orchestration and
     mesh information/log formatting helpers. Mesh truth remains owned by
     MeshProcessor; this layer only builds GUI requests, delegates work, and
-    refreshes UI state.
+    refreshes UI state.  After mesh replacement it also clears stale selection
+    evidence so old edge/face IDs cannot be reused by feature tools.
     """
 
     def _populate_runtime_options(self) -> None:
@@ -187,6 +188,65 @@ class MeshActionsMixin:
             for line in format_remesh_payload_lines(payload):
                 self.log(line)
 
+    def _refresh_mesh_navigation_state_after_mesh_change(self, *, reason: str) -> None:
+            """Clear stale selection/navigation caches after mesh source changes.
+
+            A no-op Reduce was useful during coarse Bore tests because it forced
+            the processor/viewport path to refresh even when face count did not
+            change.  Make that cache cleanup explicit after load/replacement so
+            edge IDs, face adjacency, clicked-seed metadata, and viewport
+            selection overlays do not survive across mesh states.
+            """
+
+            controller = getattr(self, "selection_controller", None)
+            if controller is None:
+                controller = getattr(self, "selection", None)
+            cleared_controller = False
+            if controller is not None and hasattr(controller, "clear_selection"):
+                try:
+                    controller.clear_selection(keep_mode=True, push=True, reason=reason)
+                    cleared_controller = True
+                except Exception:
+                    cleared_controller = False
+
+            viewport = getattr(self, "viewport", None)
+            if viewport is None:
+                viewport = getattr(self, "viewer", None)
+            viewport_clears = 0
+            if viewport is not None:
+                for name, args in (
+                    ("clear_selection", ()),
+                    ("set_edge_selection", ((),)),
+                    ("set_selected_edge_ids", ((),)),
+                    ("clear_edge_selection", ()),
+                    ("set_face_selection", ((),)),
+                    ("highlight_cells", ((),)),
+                    ("clear_face_selection", ()),
+                    ("clear_polyline", ("bore_resolved_opening",)),
+                ):
+                    fn = getattr(viewport, name, None)
+                    if callable(fn):
+                        try:
+                            fn(*args)
+                            viewport_clears += 1
+                        except Exception:
+                            pass
+                for name in ("rebuild_topology_cache", "invalidate_pick_cache", "refresh_edge_index_cache"):
+                    fn = getattr(viewport, name, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            viewport_clears += 1
+                        except Exception:
+                            pass
+
+            if hasattr(self, "log"):
+                self.log(
+                    "Mesh navigation state refreshed after mesh change: "
+                    f"reason={reason}; controller={'yes' if cleared_controller else 'no'}; "
+                    f"viewport_ops={viewport_clears}."
+                )
+
     def load_mesh(self) -> None:
             path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -206,6 +266,7 @@ class MeshActionsMixin:
                 self.current_mesh_path = str(Path(payload["source_path"]).expanduser().resolve())
                 self.current_output_path = None
                 self._load_new_source_into_viewport(self.current_mesh_path)
+                self._refresh_mesh_navigation_state_after_mesh_change(reason="mesh_load_source_replacement_v142")
                 self._clear_manual_edit_preview(silent=True)
                 self._reset_hole_fill_ui(status="No hole candidates yet. Run Find Hole Candidates.")
                 mesh = getattr(self.processor, "mesh", None)
@@ -661,6 +722,7 @@ class MeshActionsMixin:
             def on_success(result: object) -> None:
                 assert isinstance(result, dict)
                 self._refresh_viewport_from_processor()
+                self._refresh_mesh_navigation_state_after_mesh_change(reason="mesh_reduce_refresh_v142")
                 self._set_mesh_info_from_trimesh(self.processor.mesh)
                 self._log_reduce_payload(result)
                 self._show_page(self.PAGE_VIEWER)
