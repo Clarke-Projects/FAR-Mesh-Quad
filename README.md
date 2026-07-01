@@ -16,28 +16,47 @@ FAR MESH Quad is not just a mesh viewer and not just a wrapper around one extern
 
 FAR MESH Quad is in active development.
 
-Current validated checkpoint:
+Current validated package checkpoints:
 
-* Linux target: CachyOS / Arch Linux family
+* Linux targets:
+  * CachyOS / Arch Linux family
+  * Ubuntu 26.04 LTS
 * Primary live viewport: WGPU
 * Fallback viewport: PyVista / VTK
-* Current preferred package: native no-venv Arch/CachyOS package
+* Current preferred package model: native no-venv Option B
 * Package name: `far-mesh-quad-native`
 * Install root: `/opt/far-mesh-quad-native`
 * Launcher: `/usr/bin/far-mesh-quad-native`
-* Python model: system Python 3.14 with native C wrapper
-* Current development environment: `venv_sysqt314`
-* Current development launcher: `scripts/run.sh`
+* Desktop entry: `/usr/share/applications/far-mesh-quad-native.desktop`
 
-The native source installer has been validated with system dependency binding, vendored Open3D/WGPU package installation, WGPU startup, dependency imports, native wrapper launch, project restore, Bore candidate analysis, Bore rebuild, undo, redo, desktop integration, and license payload installation.
+Validated native Option B means:
 
-The public GitHub repository is intended to install from a clean clone through the Option B native source-installer path with bundled Instant Meshes, QuadWild-BiMDF, vendored Open3D, vendored WGPU stack packages, and the full license bundle.
+* no application virtual environment
+* no runtime pip install
+* system Python
+* native system dependency closure
+* curated FAR MESH runtime payload under `/opt/far-mesh-quad-native`
+* native launcher command `far-mesh-quad-native`
+* installed-root validation before the package path is considered successful
+
+The Arch / CachyOS path uses the existing native source installer and native CPython wrapper model.
+
+The Ubuntu 26.04 path uses Ubuntu apt packages for the normal dependency stack, FAR MESH-owned `.deb` packages for `rendercanvas`, `wgpu`, `pylinalg`, and `pygfx`, and a native launcher wrapper that executes:
+
+```text
+/usr/bin/python3 -m far_mesh.main
+```
+
+The public GitHub repository is intended to install from a clean clone through the native Option B source-installer paths with bundled Instant Meshes, QuadWild-BiMDF, vendored WGPU stack packages, and the full license bundle.
+
+Ubuntu 26.04 validation evidence includes clean uninstall/reinstall through the new orchestrator, installed `/opt` runtime validation, system-Python dependency imports, folderized BoreTool imports, the v177k rebuild checkpoint, desktop entry creation, and `gtk-launch far-mesh-quad-native` starting the WGPU backend.
 
 ---
 
 ## Quick links
 
-* [Install from source on Arch / CachyOS](HOW_TO_INSTALL.md)
+* [Install from source on Linux: Arch / CachyOS and Ubuntu](HOW_TO_INSTALL.md)
+* [Ubuntu native Option B install note](packaging/install/README_SOURCE_INSTALL_UBUNTU_OPTION_B.md)
 * [Advanced manual native package build](HOWTO_BUILD.md)
 * [Root license](LICENSE)
 * [FAR MESH Quad license scope notice](bin/License/LICENSE_FAR_Mesh_Quad.txt)
@@ -135,10 +154,14 @@ The BoreTool architecture keeps responsibilities separated:
 
 ## Installation
 
-### Recommended public source install
+### Recommended native Option B source installs
 
-The recommended public install path for Arch / CachyOS is the native Option B source installer.
-It installs FAR MESH Quad as a native system application without an application virtual environment.
+FAR MESH Quad currently provides validated native Option B install paths for:
+
+* Arch / CachyOS
+* Ubuntu 26.04 LTS
+
+Both paths install FAR MESH Quad as a native system application without an application virtual environment.
 
 See the full guide:
 
@@ -152,6 +175,8 @@ Fresh clone:
 git clone https://github.com/Clarke-Projects/FAR-Mesh-Quad.git
 cd FAR-Mesh-Quad
 ```
+
+### Arch / CachyOS
 
 Preview first:
 
@@ -171,10 +196,38 @@ Install on a fresh machine when you intentionally want a full system update firs
 bash packaging/install/install_far_mesh_quad.sh --target cachyos --yes --system-update
 ```
 
-Launch:
+### Ubuntu 26.04
+
+Install through the Ubuntu native Option B orchestrator:
+
+```bash
+bash packaging/install/install_ubuntu_option_b_native.sh -y
+```
+
+The Ubuntu path performs the complete native package flow:
+
+1. Installs Ubuntu apt dependencies.
+2. Builds FAR MESH-owned `.deb` packages for:
+   * `python3-rendercanvas-farmesh`
+   * `python3-wgpu-farmesh`
+   * `python3-pylinalg-farmesh`
+   * `python3-pygfx-farmesh`
+3. Builds the FAR MESH app package:
+   * `far-mesh-quad-native`
+4. Installs the WGPU stack packages.
+5. Installs the FAR MESH app package.
+6. Validates the installed `/opt` runtime.
+
+### Launch
 
 ```bash
 far-mesh-quad-native
+```
+
+Desktop launch test:
+
+```bash
+gtk-launch far-mesh-quad-native
 ```
 
 Installed layout:
@@ -196,7 +249,13 @@ Installed layout:
 /usr/share/licenses/far-mesh-quad-native/
 ```
 
-The native launcher is a compiled C wrapper. It embeds system CPython for the main GUI process and forces multiprocessing helpers back to `/usr/bin/python`, preventing recursive worker launches.
+The Arch / CachyOS native launcher uses the existing compiled C wrapper and system CPython model.
+
+The Ubuntu native launcher is a compiled C exec wrapper that starts the GUI through system Python:
+
+```text
+/usr/bin/python3 -m far_mesh.main
+```
 
 Expected startup messages may include:
 
@@ -204,14 +263,19 @@ Expected startup messages may include:
 [viewport_factory] Using WGPU viewport backend.
 preconfigure_default_device (pygfx): required_features set to {'!float32-filterable'} removes earlier set {'float32-filterable'} from the set.
 Unable to find extension: VK_EXT_physical_device_drm
+No config found!
+EGL says it can present to the window but not natively
+Max vertex attribute stride unknown. Assuming it is 2048
+qt.qpa.services: Failed to register with host portal ...
 ```
 
-The Vulkan extension warning is currently non-blocking on the validated development machine.
+These are non-blocking when the application opens and the WGPU viewport backend starts.
 
 ### Advanced manual native package build
 
 `HOWTO_BUILD.md` is kept as the advanced/manual package-build reference.
-It is useful for maintainers who want to run the lower-level `build-local-package.sh` and `pacman -U` package workflow directly. It is not the primary public install path anymore.
+It is useful for maintainers who want to run lower-level package-build workflows directly.
+It is not the primary public install path anymore.
 
 ### Option A: private-venv fallback package
 
@@ -263,7 +327,9 @@ Note: the clean public repository is validated for native package build and inst
 
 ## Runtime validation
 
-After installation or development-environment changes, validate the following:
+### Arch / CachyOS installed-root smoke test
+
+After installation or development-environment changes, validate the installed runtime:
 
 ```bash
 cd /opt/far-mesh-quad-native
@@ -274,6 +340,35 @@ import trimesh, open3d, pyvista, pyvistaqt, vtk
 import rendercanvas, wgpu, pylinalg, pygfx
 print("FAR MESH native package dependency smoke test OK")
 '
+```
+
+Then launch:
+
+```bash
+far-mesh-quad-native
+```
+
+### Ubuntu installed-root smoke test
+
+After Ubuntu native Option B installation:
+
+```bash
+cd /opt/far-mesh-quad-native
+unset PYTHONPATH
+
+/usr/bin/python3 - <<'PY'
+import far_mesh
+print("OK installed far_mesh:", getattr(far_mesh, "__file__", ""))
+
+from far_mesh.core.bore.rebuild.rebuild_inventory import rebuild_refactor_inventory_v177k
+print("OK checkpoint:", rebuild_refactor_inventory_v177k()["checkpoint"])
+PY
+```
+
+Expected checkpoint:
+
+```text
+v177k_rebuild_zero_safety_audit_validation_counts_no_behavior_change_for_valid_diagnostics
 ```
 
 Then launch:
@@ -396,9 +491,21 @@ The current preferred packaging form is Option B:
 Package: far-mesh-quad-native
 Install root: /opt/far-mesh-quad-native
 Launcher: /usr/bin/far-mesh-quad-native
-Python: system /usr/bin/python 3.14.5
-Wrapper: native C wrapper
 Private app venv: none
+```
+
+Validated native Option B variants:
+
+```text
+Arch / CachyOS:
+  Python: system /usr/bin/python 3.14.x
+  Wrapper: native C wrapper using system CPython
+  Installer: packaging/install/install_far_mesh_quad.sh --target cachyos
+
+Ubuntu 26.04:
+  Python: system /usr/bin/python3 3.14.x
+  Wrapper: native C exec wrapper launching /usr/bin/python3 -m far_mesh.main
+  Installer: packaging/install/install_ubuntu_option_b_native.sh
 ```
 
 License files are installed in both locations:
@@ -433,7 +540,7 @@ packaging/native/prebuilt/python-open3d-1:0.19.0-13-x86_64.pkg.tar.zst
 packaging/native/wgpu-stack/packages/*.pkg.tar.zst
 ```
 
-The WGPU stack packaging recipes and helper scripts are also preserved:
+Arch / CachyOS WGPU stack packaging recipes and helper scripts are preserved:
 
 ```text
 packaging/native/wgpu-stack/build-all.sh
@@ -445,6 +552,15 @@ packaging/native/wgpu-stack/python-rendercanvas/PKGBUILD
 packaging/native/wgpu-stack/python-wgpu/PKGBUILD
 ```
 
+Ubuntu native Option B packaging scripts are preserved:
+
+```text
+packaging/install/install_ubuntu_option_b_native.sh
+packaging/install/README_SOURCE_INSTALL_UBUNTU_OPTION_B.md
+packaging/native/debian/wgpu-stack/build-wgpu-stack-debs.sh
+packaging/native/debian/far-mesh-quad-native/build-local-deb.sh
+```
+
 Final built FAR MESH application packages should normally be published as GitHub Release assets rather than committed as ordinary source files.
 
 Generated build directories should not be committed:
@@ -453,6 +569,10 @@ Generated build directories should not be committed:
 packaging/**/pkg/
 packaging/**/src/
 packaging/**/_staging/
+packaging/native/debian/wgpu-stack/_build/
+packaging/native/debian/wgpu-stack/_deb/
+packaging/native/debian/far-mesh-quad-native/_build/
+packaging/native/debian/far-mesh-quad-native/_deb/
 ```
 
 ---
