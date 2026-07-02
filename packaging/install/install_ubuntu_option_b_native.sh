@@ -8,7 +8,7 @@ WGPU_DEB_DIR="${PROJECT_ROOT}/packaging/native/debian/wgpu-stack/_deb"
 
 APP_BUILDER="${PROJECT_ROOT}/packaging/native/debian/far-mesh-quad-native/build-local-deb.sh"
 APP_DEB_DIR="${PROJECT_ROOT}/packaging/native/debian/far-mesh-quad-native/_deb"
-APP_DEB="${APP_DEB_DIR}/far-mesh-quad-native_0.1.4-1_amd64.deb"
+APP_DEB="${APP_DEB_DIR}/far-mesh-quad-native_0.1.4.2-1_amd64.deb"
 
 YES=0
 SKIP_APT_UPDATE=0

@@ -8,7 +8,7 @@ OUT_DIR="${DEB_ROOT}/_deb"
 WORK_DIR="${DEB_ROOT}/_build"
 
 PKG_NAME="far-mesh-quad-native"
-PKG_VERSION="0.1.4-1"
+PKG_VERSION="0.1.4.2-1"
 APP_ROOT="/opt/far-mesh-quad-native"
 BIN_PATH="/usr/bin/far-mesh-quad-native"
 
@@ -133,7 +133,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    newargv[0] = "far-mesh-quad-native";
+    /*
+     * Keep argv[0] as the real Python executable.
+     *
+     * If argv[0] is "far-mesh-quad-native", Python multiprocessing and
+     * FAR MESH background task routing can treat the wrapper as the Python
+     * executable and relaunch the full GUI when starting worker tasks.
+     */
+    newargv[0] = "/usr/bin/python3";
     newargv[1] = "-m";
     newargv[2] = "far_mesh.main";
 
